@@ -417,6 +417,19 @@ impl DeltaScanConfig {
         if !self.schema_force_view_types {
             return field;
         }
+        // Variant columns are physically Struct{metadata: Binary, value: Binary}
+        // per the unshredded-variant kernel layout. Recursing into the struct and
+        // promoting those Binary fields to BinaryView would later trip
+        // `ensure_data_types` ("Expected Struct(Binary), got Struct(BinaryView)")
+        // on any operation (DELETE/UPDATE/MERGE) that re-reads the column.
+        if field
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(|n| n == "arrow.parquet.variant")
+            .unwrap_or(false)
+        {
+            return field;
+        }
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 if self.schema_force_view_types => field
                 .as_ref()
