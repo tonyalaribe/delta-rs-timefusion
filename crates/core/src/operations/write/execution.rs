@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema};
 use arrow_array::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ToDFSchema;
@@ -679,6 +679,75 @@ fn repartition_by_partition_columns(
     )?))
 }
 
+/// True if `field` is the Variant Arrow extension (Struct{metadata, value}).
+fn is_variant_field(field: &ArrowField) -> bool {
+    matches!(field.data_type(), ArrowDataType::Struct(fs) if fs.len() == 2
+        && fs.iter().any(|f| f.name() == "metadata"
+            && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView | ArrowDataType::LargeBinary))
+        && fs.iter().any(|f| f.name() == "value"
+            && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView | ArrowDataType::LargeBinary)))
+}
+
+/// Normalize Variant struct fields so their inner buffers are `Binary`
+/// (matches `delta_kernel::unshredded_variant()`). The DataFusion parquet
+/// reader and several other code paths surface Variant arrays as
+/// Struct{BinaryView, BinaryView} when `schema_force_view_types=true`, but
+/// `ensure_data_types` rejects that against the kernel's Binary expectation.
+fn variant_normalize_schema(schema: &Arc<Schema>) -> Arc<Schema> {
+    if !schema.fields().iter().any(|f| is_variant_field(f)) {
+        return schema.clone();
+    }
+    let normalized: Vec<ArrowField> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if is_variant_field(f) {
+                ArrowField::new(
+                    f.name(),
+                    ArrowDataType::Struct(
+                        vec![
+                            Arc::new(ArrowField::new("metadata", ArrowDataType::Binary, false)),
+                            Arc::new(ArrowField::new("value", ArrowDataType::Binary, false)),
+                        ]
+                        .into(),
+                    ),
+                    f.is_nullable(),
+                )
+                .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(normalized, schema.metadata().clone()))
+}
+
+/// Wrap each stream with a Variant-normalizing cast. No-op if `target_schema`
+/// has no Variant fields (avoids per-batch allocation in the common case).
+fn variant_normalize_streams(
+    streams: Vec<SendableRecordBatchStream>,
+    target_schema: Arc<Schema>,
+) -> Vec<SendableRecordBatchStream> {
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    if !target_schema.fields().iter().any(|f| is_variant_field(f)) {
+        return streams;
+    }
+    streams
+        .into_iter()
+        .map(|s| {
+            let sch = target_schema.clone();
+            let mapped = s.map(move |r| {
+                r.and_then(|batch| {
+                    crate::kernel::schema::cast::cast_record_batch(&batch, sch.clone(), false, false)
+                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+                })
+            });
+            Box::pin(RecordBatchStreamAdapter::new(target_schema.clone(), mapped))
+                as SendableRecordBatchStream
+        })
+        .collect()
+}
+
 async fn write_data_plan(
     session: &dyn Session,
     plan: Arc<dyn ExecutionPlan>,
@@ -695,8 +764,9 @@ async fn write_data_plan(
     } = sink_config;
     let (plan, partition_columns, random_prefix_length) =
         apply_column_mapping_to_plan(plan, partition_columns, &column_mapping)?;
+    let writer_schema = variant_normalize_schema(&plan.schema());
     let config = WriterConfig::new(
-        plan.schema().clone(),
+        writer_schema.clone(),
         partition_columns.clone(),
         writer_properties.clone(),
         target_file_size,
@@ -709,6 +779,7 @@ async fn write_data_plan(
     // For unpartitioned writes, centralize writer behavior through write_streams.
     if partition_columns.is_empty() {
         let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+        let partition_streams = variant_normalize_streams(partition_streams, writer_schema.clone());
         let scan_start = std::time::Instant::now();
         let (adds, stream_metrics) = write_streams(partition_streams, object_store, config).await?;
 
@@ -728,6 +799,7 @@ async fn write_data_plan(
 
     let plan = repartition_by_partition_columns(plan, &partition_columns)?;
     let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+    let partition_streams = variant_normalize_streams(partition_streams, writer_schema.clone());
     let scan_start = std::time::Instant::now();
 
     let mut join_set = JoinSet::new();
