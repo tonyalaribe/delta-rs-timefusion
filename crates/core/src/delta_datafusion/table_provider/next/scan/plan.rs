@@ -422,13 +422,22 @@ impl DeltaScanConfig {
         // promoting those Binary fields to BinaryView would later trip
         // `ensure_data_types` ("Expected Struct(Binary), got Struct(BinaryView)")
         // on any operation (DELETE/UPDATE/MERGE) that re-reads the column.
-        if field
-            .metadata()
-            .get("ARROW:extension:name")
-            .map(|n| n == "arrow.parquet.variant")
-            .unwrap_or(false)
-        {
-            return field;
+        // The ExtensionType marker may be missing on this field (some code
+        // paths construct fresh Field instances without it), so detect Variant
+        // structurally as a 2-field Struct with `metadata` + `value` binary
+        // children — this is the canonical unshredded-variant shape.
+        // See above comment. Detect Variant structurally because the
+        // ExtensionType marker may not be present on this field by the time
+        // it reaches the scan's physical_arrow_schema pass.
+        if let DataType::Struct(fs) = field.data_type() {
+            let is_variant = fs.len() == 2
+                && fs.iter().any(|f| f.name() == "metadata"
+                    && matches!(f.data_type(), DataType::Binary | DataType::BinaryView | DataType::LargeBinary))
+                && fs.iter().any(|f| f.name() == "value"
+                    && matches!(f.data_type(), DataType::Binary | DataType::BinaryView | DataType::LargeBinary));
+            if is_variant {
+                return field;
+            }
         }
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 if self.schema_force_view_types => field
