@@ -1193,6 +1193,43 @@ fn plan_compaction_bins_in_stable_order(
     (bins, planner_stats)
 }
 
+/// Full partition values for a rewritten file, in table partition-column
+/// order. `LogFileView::partition_values()` exposes `partitionValues_parsed`,
+/// which the kernel narrows to the predicate-referenced subset when a filter
+/// is pushed into `file_views` — grouping on it dropped the un-referenced
+/// partition columns from OPTIMIZE output (e.g. `project_id` when compacting
+/// with a `date = ...` filter), silently NULLing them on read. Rebuild from
+/// the raw string map in the Add action instead.
+fn full_partition_values(
+    snapshot: &EagerSnapshot,
+    add: &Add,
+) -> Result<IndexMap<String, Scalar>, DeltaTableError> {
+    let schema = snapshot.schema();
+    snapshot
+        .metadata()
+        .partition_columns()
+        .iter()
+        .map(|col| {
+            let field = schema.field(col).ok_or_else(|| {
+                DeltaTableError::Generic(format!("partition column {col} missing from schema"))
+            })?;
+            let DataType::Primitive(pt) = field.data_type() else {
+                return Err(DeltaTableError::Generic(format!(
+                    "unsupported partition data type for column {col}: {:?}",
+                    field.data_type()
+                )));
+            };
+            let scalar = match add.partition_values.get(col) {
+                Some(Some(raw)) => pt.parse_scalar(raw).map_err(|e| {
+                    DeltaTableError::Generic(format!("parse partition value for {col}: {e}"))
+                })?,
+                _ => Scalar::Null(field.data_type().clone()),
+            };
+            Ok((col.clone(), scalar))
+        })
+        .collect()
+}
+
 async fn build_compaction_plan(
     log_store: &dyn LogStore,
     snapshot: &EagerSnapshot,
@@ -1221,16 +1258,8 @@ async fn build_compaction_plan(
         let file = file?;
         metrics.total_considered_files += 1;
         let object_meta = ObjectMeta::try_from(&file)?;
-        let partition_values = file
-            .partition_values()
-            .map(|v| {
-                v.fields()
-                    .iter()
-                    .zip(v.values().iter())
-                    .map(|(k, v)| (k.name().to_string(), v.clone()))
-                    .collect::<IndexMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let add = file.to_add();
+        let partition_values = full_partition_values(snapshot, &add)?;
         let partition_path = partition_values.hive_partition_path();
         let entry = partition_files
             .entry(partition_path)
@@ -1244,7 +1273,7 @@ async fn build_compaction_plan(
         }
 
         entry.2.push(OrderedFileCandidate {
-            add: file.to_add(),
+            add,
             stable_ordinal,
             size_bytes: object_meta.size,
         });
@@ -1355,22 +1384,14 @@ async fn build_zorder_plan(
     let mut file_stream = snapshot.file_views(log_store, predicate);
     while let Some(file) = file_stream.next().await {
         let file = file?;
-        let partition_values = file
-            .partition_values()
-            .map(|v| {
-                v.fields()
-                    .iter()
-                    .zip(v.values().iter())
-                    .map(|(k, v)| (k.name().to_string(), v.clone()))
-                    .collect::<IndexMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let add = file.to_add();
+        let partition_values = full_partition_values(snapshot, &add)?;
         metrics.total_considered_files += 1;
         partition_files
             .entry(partition_values.hive_partition_path())
             .or_insert_with(|| (partition_values, MergeBin::new()))
             .1
-            .add(file.to_add());
+            .add(add);
         debug!("partition_files inside the zorder plan: {partition_files:?}");
     }
 
