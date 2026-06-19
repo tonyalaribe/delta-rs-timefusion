@@ -35,9 +35,16 @@ use datafusion::{
         plan_err, stats::Precision,
     },
     config::TableParquetOptions,
-    datasource::physical_plan::{ParquetSource, parquet::CachedParquetFileReaderFactory},
+    datasource::physical_plan::{
+        ParquetSource,
+        parquet::{
+            CachedParquetFileReaderFactory,
+            metadata::{DFParquetMetadata, ordering_from_parquet_metadata},
+        },
+    },
     error::DataFusionError,
-    execution::object_store::ObjectStoreUrl,
+    execution::{cache::cache_manager::FileMetadataCache, object_store::ObjectStoreUrl},
+    physical_expr::LexOrdering,
     physical_plan::{
         ExecutionPlan,
         empty::EmptyExec,
@@ -60,7 +67,7 @@ use delta_kernel::{
 };
 use futures::{Stream, TryStreamExt as _, future::ready};
 use itertools::Itertools as _;
-use object_store::{ObjectMeta, path::Path};
+use object_store::{ObjectMeta, ObjectStore, path::Path};
 use tracing::debug;
 use url::Url;
 
@@ -669,9 +676,11 @@ async fn get_read_plan(
     let adapter_factory = Arc::new(DefaultPhysicalExprAdapterFactory {});
 
     for (store_url, files) in files_by_store.into_iter() {
+        let object_store = state.runtime_env().object_store(&store_url)?;
+        let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
         let reader_factory = Arc::new(CachedParquetFileReaderFactory::new(
-            state.runtime_env().object_store(&store_url)?,
-            state.runtime_env().cache_manager.get_file_metadata_cache(),
+            object_store.clone(),
+            metadata_cache.clone(),
         ));
 
         // NOTE: In the "next" provider, DataFusion's Parquet scan partition fields are file-id
@@ -728,18 +737,31 @@ async fn get_read_plan(
             }
         }
 
+        // Derive a scan-wide output ordering from the parquet footers. After TimeFusion's
+        // "Option A" fix only files actually written in sort order declare `sorting_columns`,
+        // so a footer-derived ordering never over-claims. Loading the footers here is cache-
+        // backed (same metadata cache the reader uses), so it front-loads reads the scan does
+        // anyway rather than adding net IO.
+        let output_ordering =
+            derive_common_ordering(object_store.as_ref(), &metadata_cache, &files, parquet_read_schema)
+                .await;
+
         let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
 
-        let config = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
+        let mut config = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
             .with_file_groups(file_groups)
             .with_statistics(statistics)
             .with_limit(limit)
-            .with_expr_adapter(Some(adapter_factory.clone() as _))
-            .build();
+            .with_expr_adapter(Some(adapter_factory.clone() as _));
+        if let Some(ordering) = output_ordering {
+            // Auto-enables `preserve_order`: DataFusion keeps each file group's order and
+            // merges groups with a SortPreservingMergeExec instead of concatenating.
+            config = config.with_output_ordering(vec![ordering]);
+        }
 
-        plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
+        plans.push(DataSourceExec::from_data_source(config.build()) as Arc<dyn ExecutionPlan>);
     }
 
     Ok(match plans.len() {
@@ -747,6 +769,33 @@ async fn get_read_plan(
         1 => plans.remove(0),
         _ => UnionExec::try_new(plans)?,
     })
+}
+
+/// Returns a scan-wide [`LexOrdering`] iff **every** file declares the **same** non-empty
+/// parquet `sorting_columns` footer, else `None`. The conservative all-or-nothing rule keeps
+/// the advertised ordering honest for the union of files: a single unsorted file (e.g. a
+/// Z-ordered/compacted file, which declares no ordering) disables the claim for the scan.
+async fn derive_common_ordering(
+    store: &dyn ObjectStore,
+    cache: &Arc<dyn FileMetadataCache>,
+    files: &[(PartitionedFile, Option<Vec<bool>>)],
+    read_schema: &SchemaRef,
+) -> Option<LexOrdering> {
+    let mut common: Option<LexOrdering> = None;
+    for (file, _) in files {
+        let meta = DFParquetMetadata::new(store, &file.object_meta)
+            .with_file_metadata_cache(Some(cache.clone()))
+            .fetch_metadata()
+            .await
+            .ok()?;
+        let ordering = ordering_from_parquet_metadata(&meta, read_schema).ok().flatten()?;
+        match &common {
+            None => common = Some(ordering),
+            Some(existing) if *existing != ordering => return None,
+            _ => {}
+        }
+    }
+    common
 }
 
 // Small helper to reuse some code between exec and exec_meta

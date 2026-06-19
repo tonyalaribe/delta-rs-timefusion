@@ -22,7 +22,7 @@ use datafusion::common::{
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::collect_columns;
-use datafusion::physical_expr::{Distribution, EquivalenceProperties};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -150,6 +150,27 @@ impl DisplayAs for DeltaScanExec {
     }
 }
 
+/// Re-express a column-only `LexOrdering` over `schema`, resolving each sort column by name.
+/// Keeps the longest satisfiable prefix: stops at the first sort expr that is not a plain column
+/// or whose column is absent from `schema` (e.g. pruned by projection). Returns `None` if not
+/// even the leading column survives.
+fn remap_ordering_to_schema(ordering: &LexOrdering, schema: &SchemaRef) -> Option<LexOrdering> {
+    let mut exprs = Vec::with_capacity(ordering.len());
+    for sort in ordering.iter() {
+        let Some(col) = sort.expr.as_any().downcast_ref::<Column>() else {
+            break;
+        };
+        let Some((index, _)) = schema.column_with_name(col.name()) else {
+            break;
+        };
+        exprs.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(col.name(), index)),
+            sort.options,
+        ));
+    }
+    LexOrdering::new(exprs)
+}
+
 impl DeltaScanExec {
     pub(crate) fn new(
         scan_plan: Arc<KernelScanPlan>,
@@ -165,8 +186,24 @@ impl DeltaScanExec {
             .contract
             .retain_file_id
             .then(|| scan_plan.contract.file_id_field.name().to_owned());
+        // Propagate the inner parquet scan's output ordering (set from honest footers in
+        // get_read_plan) onto our post-transform output schema. The kernel transform is
+        // order-preserving (project/cast/append-file-id only), so the order survives; we only
+        // need to re-resolve the sort columns by name because the output schema reorders/adds
+        // columns (partition cols, file id).
+        let output_schema = &scan_plan.contract.output_schema;
+        let orderings = input
+            .properties()
+            .output_ordering()
+            .and_then(|ordering| remap_ordering_to_schema(ordering, output_schema));
+        let eq_properties = match orderings {
+            Some(ordering) => {
+                EquivalenceProperties::new_with_orderings(Arc::clone(output_schema), [ordering])
+            }
+            None => EquivalenceProperties::new(Arc::clone(output_schema)),
+        };
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&scan_plan.contract.output_schema)),
+            eq_properties,
             input.properties().partitioning.clone(),
             input.properties().emission_type,
             input.properties().boundedness,
@@ -804,6 +841,40 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn remap_ordering_keeps_satisfiable_prefix() {
+        use arrow::compute::SortOptions;
+        // Ordering as it comes off the inner parquet scan: [timestamp@0, id@1, level@2].
+        let src = LexOrdering::new(vec![
+            PhysicalSortExpr::new(Arc::new(Column::new("timestamp", 0)), SortOptions::default()),
+            PhysicalSortExpr::new(Arc::new(Column::new("id", 1)), SortOptions::default()),
+            PhysicalSortExpr::new(Arc::new(Column::new("level", 2)), SortOptions::default()),
+        ])
+        .unwrap();
+
+        // Output schema reorders columns and drops `level` (projection pruned it).
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("service", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Int64, true),
+        ]));
+        let out = remap_ordering_to_schema(&src, &schema).expect("leading column resolves");
+        // Prefix preserved up to the first missing column, re-indexed by name: timestamp@2, id@0.
+        let cols: Vec<(&str, usize)> = out
+            .iter()
+            .map(|s| {
+                let c = s.expr.as_any().downcast_ref::<Column>().unwrap();
+                (c.name(), c.index())
+            })
+            .collect();
+        assert_eq!(cols, vec![("timestamp", 2), ("id", 0)]);
+
+        // No satisfiable prefix → no ordering.
+        let bare: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("other", DataType::Utf8, true)]));
+        assert!(remap_ordering_to_schema(&src, &bare).is_none());
+    }
     use crate::{
         assert_batches_sorted_eq,
         delta_datafusion::{
