@@ -65,7 +65,7 @@ use delta_kernel::{
     Engine, Expression, engine::arrow_data::ArrowEngineData, expressions::StructData,
     scan::ScanMetadata, table_features::TableFeature,
 };
-use futures::{Stream, TryStreamExt as _, future::ready};
+use futures::{Stream, StreamExt as _, TryStreamExt as _, future::ready};
 use itertools::Itertools as _;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use tracing::debug;
@@ -742,9 +742,13 @@ async fn get_read_plan(
         // so a footer-derived ordering never over-claims. Loading the footers here is cache-
         // backed (same metadata cache the reader uses), so it front-loads reads the scan does
         // anyway rather than adding net IO.
-        let output_ordering =
-            derive_common_ordering(object_store.as_ref(), &metadata_cache, &files, parquet_read_schema)
-                .await;
+        let output_ordering = derive_common_ordering(
+            object_store.clone(),
+            metadata_cache.clone(),
+            &files,
+            parquet_read_schema.clone(),
+        )
+        .await;
 
         let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
         let (file_groups, statistics) =
@@ -776,19 +780,40 @@ async fn get_read_plan(
 /// the advertised ordering honest for the union of files: a single unsorted file (e.g. a
 /// Z-ordered/compacted file, which declares no ordering) disables the claim for the scan.
 async fn derive_common_ordering(
-    store: &dyn ObjectStore,
-    cache: &Arc<dyn FileMetadataCache>,
+    store: Arc<dyn ObjectStore>,
+    cache: Arc<dyn FileMetadataCache>,
     files: &[(PartitionedFile, Option<Vec<bool>>)],
-    read_schema: &SchemaRef,
+    read_schema: SchemaRef,
 ) -> Option<LexOrdering> {
+    // Fetch footers concurrently (bounded). On a cold metadata cache a scan can span hundreds
+    // of files; a serial loop would add that many sequential footer reads to *planning*. The
+    // cache is shared with the reader, so these reads also warm execution. The per-file futures
+    // own (Arc-clone) everything they touch so the parent scan future stays lifetime-general.
+    const FOOTER_FETCH_CONCURRENCY: usize = 16;
+    // Detach from `files` (owned ObjectMeta) before building futures so the per-file closure
+    // takes an owned value — a closure over a borrowed scan item is not lifetime-general and
+    // makes the whole scan future fail HRTB inference.
+    let object_metas: Vec<ObjectMeta> = files.iter().map(|(f, _)| f.object_meta.clone()).collect();
+    let fetches = object_metas.into_iter().map(|object_meta| {
+        let (store, cache, read_schema) = (store.clone(), cache.clone(), read_schema.clone());
+        async move {
+            let meta = DFParquetMetadata::new(store.as_ref(), &object_meta)
+                .with_file_metadata_cache(Some(cache))
+                .fetch_metadata()
+                .await
+                .ok()?;
+            ordering_from_parquet_metadata(&meta, &read_schema).ok().flatten()
+        }
+    });
+    let orderings: Vec<Option<LexOrdering>> = futures::stream::iter(fetches)
+        .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+
     let mut common: Option<LexOrdering> = None;
-    for (file, _) in files {
-        let meta = DFParquetMetadata::new(store, &file.object_meta)
-            .with_file_metadata_cache(Some(cache.clone()))
-            .fetch_metadata()
-            .await
-            .ok()?;
-        let ordering = ordering_from_parquet_metadata(&meta, read_schema).ok().flatten()?;
+    for ordering in orderings {
+        // Any missing footer or fetch error disables the claim for the whole scan.
+        let ordering = ordering?;
         match &common {
             None => common = Some(ordering),
             Some(existing) if *existing != ordering => return None,
