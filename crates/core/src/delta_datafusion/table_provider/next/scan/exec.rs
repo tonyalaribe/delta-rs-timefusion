@@ -157,7 +157,7 @@ impl DisplayAs for DeltaScanExec {
 fn remap_ordering_to_schema(ordering: &LexOrdering, schema: &SchemaRef) -> Option<LexOrdering> {
     let mut exprs = Vec::with_capacity(ordering.len());
     for sort in ordering.iter() {
-        let Some(col) = sort.expr.as_any().downcast_ref::<Column>() else {
+        let Some(col) = sort.expr.downcast_ref::<Column>() else {
             break;
         };
         let Some((index, _)) = schema.column_with_name(col.name()) else {
@@ -864,7 +864,7 @@ mod tests {
         let cols: Vec<(&str, usize)> = out
             .iter()
             .map(|s| {
-                let c = s.expr.as_any().downcast_ref::<Column>().unwrap();
+                let c = s.expr.downcast_ref::<Column>().unwrap();
                 (c.name(), c.index())
             })
             .collect();
