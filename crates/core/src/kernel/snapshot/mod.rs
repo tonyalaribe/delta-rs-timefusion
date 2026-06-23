@@ -15,11 +15,12 @@
 //!
 //!
 
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::{filter_record_batch, is_not_null};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType as ArrowDataType, SchemaRef};
 use delta_kernel::actions::{Remove, Sidecar};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -304,11 +305,46 @@ impl Snapshot {
         engine: Arc<dyn Engine>,
         target_version: Version,
     ) -> DeltaResult<Arc<Self>> {
+        self.advance_with_removes(engine, target_version, &HashSet::new())
+            .await
+    }
+
+    /// Like [`advance_append`](Self::advance_append) but also applies the file
+    /// removals in `(current, target]`: carries the materialized file list
+    /// forward, drops the tombstoned `removed_paths` with a vectorized filter,
+    /// and appends only the freshly-scanned added files. O(active files) for
+    /// the filter (a cheap columnar pass — no stats re-materialization) plus
+    /// O(files added) for the scan, versus the O(active files) kernel
+    /// re-materialize a full [`update`](Self::update) pays (re-streaming every
+    /// active file's stats through the scan-metadata visitor).
+    ///
+    /// `removed_paths` are raw (log-encoded) file paths, matching the scan-row
+    /// `path` column and [`Remove::path`]. An empty set is exactly
+    /// [`advance_append`](Self::advance_append).
+    ///
+    /// Falls back to [`update`](Self::update) when the snapshot isn't
+    /// materialized, the move isn't forward, or the carried `path` column is an
+    /// unexpected type the filter can't read.
+    async fn advance_with_removes(
+        self: Arc<Self>,
+        engine: Arc<dyn Engine>,
+        target_version: Version,
+        removed_paths: &HashSet<String>,
+    ) -> DeltaResult<Arc<Self>> {
         let current_version = self.version();
         let seed = match self.materialized_files().and_then(|m| m.full_table_seed()) {
             Some(seed) if target_version > current_version => seed,
             // Not materialized, or not a forward move — defer to the full path.
             _ => return self.update(engine, Some(target_version)).await,
+        };
+
+        // Drop tombstoned files from the carried-forward batches BEFORE touching
+        // the engine, so an unsupported `path` column type can fall back cleanly.
+        let (_v, existing, _pred) = seed.into_parts();
+        let carried: Vec<RecordBatch> = existing.collect();
+        let mut batches = match drop_removed_paths(carried, removed_paths)? {
+            Some(filtered) => filtered,
+            None => return self.update(engine, Some(target_version)).await,
         };
 
         // New kernel snapshot at the target version (no file materialization).
@@ -341,9 +377,6 @@ impl Snapshot {
             .try_collect()
             .await?;
 
-        // Carry existing batches forward (cheap Arc clones) and append the delta.
-        let (_v, existing, _pred) = seed.into_parts();
-        let mut batches: Vec<RecordBatch> = existing.collect();
         batches.extend(delta);
         let materialized = Arc::new(MaterializedFiles::full(target_version, batches));
         Ok(Arc::new(
@@ -1145,6 +1178,38 @@ pub(crate) enum MaterializedFilesScope {
     FullTable,
 }
 
+/// Filter tombstoned files out of carried-forward scan-row batches by matching
+/// the raw `path` column against `removed`. Vectorized per batch. Returns
+/// `Ok(None)` when the `path` column is missing or an unexpected type, so the
+/// caller can fall back to a full update; `removed` empty is an untouched
+/// passthrough (the append-only fast path).
+fn drop_removed_paths(
+    batches: Vec<RecordBatch>,
+    removed: &HashSet<String>,
+) -> DeltaResult<Option<Vec<RecordBatch>>> {
+    if removed.is_empty() {
+        return Ok(Some(batches));
+    }
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let Some(col) = batch.column_by_name("path") else {
+            return Ok(None);
+        };
+        // `get_string_value` reads only Utf8/LargeUtf8/Utf8View; bail to a full
+        // update on any other path column type rather than dropping nothing.
+        if !matches!(col.data_type(), ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View) {
+            return Ok(None);
+        }
+        let keep: BooleanArray = (0..batch.num_rows())
+            .map(|i| !iterators::get_string_value(col, i).is_some_and(|p| removed.contains(p)))
+            .collect();
+        // Most carried batches are untouched by a partition-scoped replace_where
+        // — skip the (copying) filter when nothing was removed from this one.
+        out.push(if keep.false_count() == 0 { batch } else { filter_record_batch(&batch, &keep)? });
+    }
+    Ok(Some(out))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MaterializedFiles {
     pub(crate) version: Version,
@@ -1371,25 +1436,46 @@ impl EagerSnapshot {
         Ok(())
     }
 
-    /// Catch up to the table's latest version cheaply *iff* the whole range
-    /// since the current version is append-only (no `Remove` actions): carry
-    /// the materialized file list forward and append only the new files,
-    /// instead of re-collecting the entire active set (the O(active files) cost
-    /// of a full [`update`](Self::update)).
+    /// Advance the materialized snapshot to `version` applying the file
+    /// removals in `removed_paths` (raw log-encoded paths). See
+    /// [`Snapshot::advance_with_removes`]. Falls back to a full update when the
+    /// snapshot isn't materialized or the move isn't forward.
+    pub async fn advance_with_removes(
+        &mut self,
+        log_store: &dyn LogStore,
+        version: Version,
+        removed_paths: &HashSet<String>,
+    ) -> DeltaResult<()> {
+        log_store.refresh().await?;
+        self.snapshot = self
+            .snapshot
+            .clone()
+            .advance_with_removes(log_store.engine(None), version, removed_paths)
+            .await?;
+        Ok(())
+    }
+
+    /// Catch up to the table's latest version cheaply by carrying the
+    /// materialized file list forward — applying the commit range's adds (scan
+    /// only the new files) and removes (vectorized filter of tombstoned paths)
+    /// — instead of re-collecting the entire active set (the O(active files)
+    /// cost of a full [`update`](Self::update)). Handles append-only *and*
+    /// remove-bearing ranges (compaction / `replace_where`).
     ///
     /// Returns `false` — signalling the caller to do a full update — when the
-    /// snapshot isn't materialized, isn't behind, is behind by more than
-    /// `max_gap` commits, or any commit in the range removes files (removes
-    /// can't be applied by a forward-only append, so a full reconcile is
-    /// required). The bounded gap keeps the per-commit Remove check (one log
-    /// read each) cheap.
+    /// snapshot isn't materialized, isn't behind, or is behind by more than
+    /// `max_gap` commits. The bounded gap keeps the per-commit action read (one
+    /// log read each, to collect removed paths) cheap.
     ///
-    /// Only `Remove` needs guarding: `advance_append` rebuilds the kernel
-    /// snapshot from the log at the target version, so `MetaData`/`Protocol`
-    /// changes in the range (schema evolution, table properties) ARE applied —
-    /// only the file list is carried forward, and only removes invalidate it.
-    /// See `advance_appends_only_applies_metadata_changes`.
-    pub async fn advance_appends_only(&mut self, log_store: &dyn LogStore, max_gap: u64) -> DeltaResult<bool> {
+    /// `MetaData`/`Protocol` changes in the range (schema evolution, table
+    /// properties) ARE applied: `advance_with_removes` rebuilds the kernel
+    /// snapshot from the log at the target version. See
+    /// `advance_catchup_applies_metadata_changes`.
+    pub async fn advance_catchup(
+        &mut self,
+        log_store: &dyn LogStore,
+        max_gap: u64,
+    ) -> DeltaResult<bool> {
         if !self.has_materialized_files() {
             return Ok(false);
         }
@@ -1399,15 +1485,22 @@ impl EagerSnapshot {
         if target <= current || target - current > max_gap {
             return Ok(false);
         }
+        let mut removed_paths = HashSet::new();
         for v in (current + 1)..=target {
             let Some(bytes) = log_store.read_commit_entry(v).await? else {
                 return Ok(false);
             };
-            if crate::logstore::get_actions(v, &bytes)?.iter().any(|a| matches!(a, Action::Remove(_))) {
-                return Ok(false);
+            for action in crate::logstore::get_actions(v, &bytes)? {
+                if let Action::Remove(remove) = action {
+                    removed_paths.insert(remove.path);
+                }
             }
         }
-        self.snapshot = self.snapshot.clone().advance_append(log_store.engine(None), target).await?;
+        self.snapshot = self
+            .snapshot
+            .clone()
+            .advance_with_removes(log_store.engine(None), target, &removed_paths)
+            .await?;
         Ok(true)
     }
 
@@ -2658,27 +2751,30 @@ mod tests {
         Ok(())
     }
 
-    /// `fast_append_advance` must be ignored for commits that carry Removes: the
-    /// post-commit hook falls back to the full update so removed files are
-    /// dropped, not retained by a blind append. An Overwrite commit under the
-    /// flag must yield the same file set as the authoritative full update.
+    /// Under `incremental_advance` a commit that carries Removes (Overwrite)
+    /// must still yield the correct active set: the hook carries the file list
+    /// forward, drops the removed paths, and appends the new ones — matching the
+    /// authoritative full update. This is the Tier-C remove-aware path; a blind
+    /// append would wrongly retain the tombstoned v1 file.
     #[tokio::test(flavor = "multi_thread")]
-    async fn fast_advance_falls_back_when_commit_removes_files() -> TestResult {
+    async fn incremental_advance_applies_removes() -> TestResult {
         use crate::kernel::transaction::CommitProperties;
         use crate::protocol::SaveMode;
-        use crate::writer::test_utils::{create_initialized_table, datafusion::write_batch, get_record_batch};
+        use crate::writer::test_utils::{
+            create_initialized_table, datafusion::write_batch, get_record_batch,
+        };
 
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().to_str().unwrap();
         let table = create_initialized_table(path, &[]).await; // v0
         let table = write_batch(table, get_record_batch(None, false)).await; // v1: file A
 
-        // Overwrite under the fast-advance flag → the commit carries Removes for
-        // v1's files, so the hook must take the full update, not the append path.
+        // Overwrite under the incremental-advance flag → the commit carries
+        // Removes for v1's files; the hook applies them via advance_with_removes.
         let table = table
             .write(vec![get_record_batch(None, false)])
             .with_save_mode(SaveMode::Overwrite)
-            .with_commit_properties(CommitProperties::default().with_fast_append_advance(true))
+            .with_commit_properties(CommitProperties::default().with_incremental_advance(true))
             .await?;
         assert_eq!(table.version(), Some(2));
 
@@ -2691,7 +2787,8 @@ mod tests {
             .try_collect()
             .await?;
         // Authoritative full update from v1 → v2.
-        let mut truth = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        let mut truth =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
         truth.update(log_store.as_ref(), Some(2)).await?;
         let mut truth_paths: Vec<String> = truth
             .file_views(log_store.as_ref(), None)
@@ -2702,19 +2799,21 @@ mod tests {
         truth_paths.sort();
         assert_eq!(
             hook_paths, truth_paths,
-            "Overwrite under fast-advance must drop removed files (hook fell back to full update)"
+            "incremental advance over an Overwrite must drop removed files and match the full update"
         );
         Ok(())
     }
 
-    /// The refresh fast-path: an append-only catch-up must match a full update,
-    /// and a range containing Removes must refuse (return false) so the caller
-    /// does the full reconcile.
+    /// The refresh catch-up path must match a full update for BOTH an
+    /// append-only range and a range that carries Removes (Overwrite): it now
+    /// applies removes incrementally instead of refusing.
     #[tokio::test(flavor = "multi_thread")]
-    async fn advance_appends_only_catches_up_and_guards_removes() -> TestResult {
+    async fn advance_catchup_applies_adds_and_removes() -> TestResult {
         use crate::kernel::transaction::CommitProperties;
         use crate::protocol::SaveMode;
-        use crate::writer::test_utils::{create_initialized_table, datafusion::write_batch, get_record_batch};
+        use crate::writer::test_utils::{
+            create_initialized_table, datafusion::write_batch, get_record_batch,
+        };
 
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().to_str().unwrap();
@@ -2724,38 +2823,73 @@ mod tests {
         let log_store = table.log_store();
 
         // Append-only catch-up v1 → v2 must succeed and match a full update.
-        let mut fast = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
-        assert!(fast.advance_appends_only(log_store.as_ref(), 64).await?, "append-only range must take the fast path");
+        let mut fast =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        assert!(
+            fast.advance_catchup(log_store.as_ref(), 64).await?,
+            "append-only range must take the catch-up path"
+        );
         assert_eq!(fast.version(), 2);
-        let mut full = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        let mut full =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
         full.update(log_store.as_ref(), Some(2)).await?;
-        let mut a: Vec<String> = fast.file_views(log_store.as_ref(), None).map_ok(|f| f.path_raw().to_string()).try_collect().await?;
-        let mut b: Vec<String> = full.file_views(log_store.as_ref(), None).map_ok(|f| f.path_raw().to_string()).try_collect().await?;
-        a.sort();
-        b.sort();
-        assert_eq!(a, b, "append-only catch-up must match full update");
+        let paths = |s: &EagerSnapshot| {
+            let ls = log_store.clone();
+            let s = s.clone();
+            async move {
+                let mut p: Vec<String> = s
+                    .file_views(ls.as_ref(), None)
+                    .map_ok(|f| f.path_raw().to_string())
+                    .try_collect()
+                    .await?;
+                p.sort();
+                Ok::<_, DeltaTableError>(p)
+            }
+        };
+        assert_eq!(
+            paths(&fast).await?,
+            paths(&full).await?,
+            "append-only catch-up must match full update"
+        );
 
-        // An Overwrite (carries Removes): a snapshot pinned before it must refuse.
-        table
+        // An Overwrite (carries Removes) tombstones the v1/v2 files: a snapshot
+        // pinned before it must catch up incrementally AND match the full update.
+        let table = table
             .write(vec![get_record_batch(None, false)])
             .with_save_mode(SaveMode::Overwrite)
             .with_commit_properties(CommitProperties::default())
-            .await?; // v3 removes v1/v2 files
-        let mut guarded = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(2)).await?;
-        assert!(!guarded.advance_appends_only(log_store.as_ref(), 64).await?, "range with removes must fall back to full update");
+            .await?; // v3
+        let target = table.version().unwrap();
+        let mut fast3 =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(2)).await?;
+        assert!(
+            fast3.advance_catchup(log_store.as_ref(), 64).await?,
+            "range with removes must catch up incrementally"
+        );
+        assert_eq!(fast3.version(), target);
+        let mut full3 =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(2)).await?;
+        full3.update(log_store.as_ref(), Some(target)).await?;
+        assert_eq!(
+            paths(&fast3).await?,
+            paths(&full3).await?,
+            "remove-bearing catch-up must match full update"
+        );
         Ok(())
     }
 
-    /// A MetaData-only commit (no Remove) takes the append-only fast path AND
-    /// the property change is applied — guards against the worry that the
-    /// fast path silently keeps stale schema/metadata. advance_append rebuilds
-    /// the kernel snapshot from the log, so only the file list is carried
-    /// forward; MetaData/Protocol are replayed.
+    /// A MetaData-only commit (no Remove) takes the catch-up path AND the
+    /// property change is applied — guards against the worry that the fast path
+    /// silently keeps stale schema/metadata. advance_with_removes rebuilds the
+    /// kernel snapshot from the log, so only the file list is carried forward;
+    /// MetaData/Protocol are replayed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn advance_appends_only_applies_metadata_changes() -> TestResult {
+    async fn advance_catchup_applies_metadata_changes() -> TestResult {
         use std::collections::HashMap;
 
-        use crate::writer::test_utils::{create_initialized_table, datafusion::write_batch, get_record_batch};
+        use crate::writer::test_utils::{
+            create_initialized_table, datafusion::write_batch, get_record_batch,
+        };
 
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().to_str().unwrap();
@@ -2764,18 +2898,25 @@ mod tests {
         // MetaData-only commit (no Remove): change a table property.
         let table = table
             .set_tbl_properties()
-            .with_properties(HashMap::from([("delta.checkpointInterval".to_string(), "77".to_string())]))
+            .with_properties(HashMap::from([(
+                "delta.checkpointInterval".to_string(),
+                "77".to_string(),
+            )]))
             .await?; // v2
         let log_store = table.log_store();
         let target = table.version().unwrap();
 
-        let mut snap = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
-        assert!(snap.advance_appends_only(log_store.as_ref(), 64).await?, "metadata-only range (no Remove) takes the fast path");
+        let mut snap =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        assert!(
+            snap.advance_catchup(log_store.as_ref(), 64).await?,
+            "metadata-only range (no Remove) takes the catch-up path"
+        );
         assert_eq!(snap.version(), target);
         assert_eq!(
             snap.table_properties().checkpoint_interval.map(|n| n.get()),
             Some(77),
-            "advance_appends_only must apply MetaData (table property) from the range"
+            "advance_catchup must apply MetaData (table property) from the range"
         );
         Ok(())
     }
