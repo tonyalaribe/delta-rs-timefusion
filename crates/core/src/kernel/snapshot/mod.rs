@@ -1383,6 +1383,12 @@ impl EagerSnapshot {
     /// can't be applied by a forward-only append, so a full reconcile is
     /// required). The bounded gap keeps the per-commit Remove check (one log
     /// read each) cheap.
+    ///
+    /// Only `Remove` needs guarding: `advance_append` rebuilds the kernel
+    /// snapshot from the log at the target version, so `MetaData`/`Protocol`
+    /// changes in the range (schema evolution, table properties) ARE applied —
+    /// only the file list is carried forward, and only removes invalidate it.
+    /// See `advance_appends_only_applies_metadata_changes`.
     pub async fn advance_appends_only(&mut self, log_store: &dyn LogStore, max_gap: u64) -> DeltaResult<bool> {
         if !self.has_materialized_files() {
             return Ok(false);
@@ -2737,6 +2743,40 @@ mod tests {
             .await?; // v3 removes v1/v2 files
         let mut guarded = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(2)).await?;
         assert!(!guarded.advance_appends_only(log_store.as_ref(), 64).await?, "range with removes must fall back to full update");
+        Ok(())
+    }
+
+    /// A MetaData-only commit (no Remove) takes the append-only fast path AND
+    /// the property change is applied — guards against the worry that the
+    /// fast path silently keeps stale schema/metadata. advance_append rebuilds
+    /// the kernel snapshot from the log, so only the file list is carried
+    /// forward; MetaData/Protocol are replayed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn advance_appends_only_applies_metadata_changes() -> TestResult {
+        use std::collections::HashMap;
+
+        use crate::writer::test_utils::{create_initialized_table, datafusion::write_batch, get_record_batch};
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_str().unwrap();
+        let table = create_initialized_table(path, &[]).await; // v0
+        let table = write_batch(table, get_record_batch(None, false)).await; // v1
+        // MetaData-only commit (no Remove): change a table property.
+        let table = table
+            .set_tbl_properties()
+            .with_properties(HashMap::from([("delta.checkpointInterval".to_string(), "77".to_string())]))
+            .await?; // v2
+        let log_store = table.log_store();
+        let target = table.version().unwrap();
+
+        let mut snap = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        assert!(snap.advance_appends_only(log_store.as_ref(), 64).await?, "metadata-only range (no Remove) takes the fast path");
+        assert_eq!(snap.version(), target);
+        assert_eq!(
+            snap.table_properties().checkpoint_interval.map(|n| n.get()),
+            Some(77),
+            "advance_appends_only must apply MetaData (table property) from the range"
+        );
         Ok(())
     }
 
