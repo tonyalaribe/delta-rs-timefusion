@@ -506,6 +506,12 @@ pub struct PostCommitHookProperties {
     create_checkpoint: bool,
     /// Override the EnableExpiredLogCleanUp setting, if None config setting is used
     cleanup_expired_logs: Option<bool>,
+    /// For append-only commits (only Add actions), advance the post-commit
+    /// snapshot by appending the new files to the existing materialized file
+    /// list instead of re-streaming the whole active set — O(files added) per
+    /// commit rather than O(active files). Falls back to a full update when the
+    /// commit isn't append-only or the snapshot isn't materialized.
+    fast_append_advance: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -517,6 +523,7 @@ pub struct CommitProperties {
     max_retries: usize,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
+    fast_append_advance: bool,
 }
 
 impl Default for CommitProperties {
@@ -527,6 +534,7 @@ impl Default for CommitProperties {
             max_retries: DEFAULT_RETRIES,
             create_checkpoint: true,
             cleanup_expired_logs: None,
+            fast_append_advance: false,
         }
     }
 }
@@ -570,6 +578,13 @@ impl CommitProperties {
         self.cleanup_expired_logs = cleanup_expired_logs;
         self
     }
+
+    /// Enable the append-only fast snapshot advance (see
+    /// [`PostCommitHookProperties::fast_append_advance`]).
+    pub fn with_fast_append_advance(mut self, fast_append_advance: bool) -> Self {
+        self.fast_append_advance = fast_append_advance;
+        self
+    }
 }
 
 impl From<CommitProperties> for CommitBuilder {
@@ -580,6 +595,7 @@ impl From<CommitProperties> for CommitBuilder {
             post_commit_hook: Some(PostCommitHookProperties {
                 create_checkpoint: value.create_checkpoint,
                 cleanup_expired_logs: value.cleanup_expired_logs,
+                fast_append_advance: value.fast_append_advance,
             }),
             app_transaction: value.app_transaction,
             ..Default::default()
@@ -795,6 +811,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                             data: this.data,
                             create_checkpoint: false,
                             cleanup_expired_logs: None,
+                            fast_append_advance: false,
                             log_store: this.log_store,
                             table_data: None,
                             custom_execute_handler: this.post_commit_hook_handler,
@@ -935,6 +952,10 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                                     .post_commit
                                     .map(|v| v.cleanup_expired_logs)
                                     .unwrap_or_default(),
+                                fast_append_advance: this
+                                    .post_commit
+                                    .map(|v| v.fast_append_advance)
+                                    .unwrap_or_default(),
                                 log_store: this.log_store,
                                 table_data: Some(Box::new(read_snapshot)),
                                 custom_execute_handler: this.post_commit_hook_handler,
@@ -987,6 +1008,7 @@ pub struct PostCommit {
     pub data: CommitData,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
+    fast_append_advance: bool,
     log_store: LogStoreRef,
     table_data: Option<Box<dyn TableReference>>,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
@@ -1000,7 +1022,21 @@ impl PostCommit {
             let post_commit_operation_id = Uuid::new_v4();
             let mut snapshot = table.eager_snapshot().clone();
             if self.version != snapshot.version() {
-                snapshot.update(&self.log_store, Some(self.version)).await?;
+                // Append-only commits (no Remove actions) can advance the
+                // materialized file list by appending the new files instead of
+                // re-streaming the whole active set — O(files added) per commit.
+                let append_only = !self
+                    .data
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Remove(_)));
+                if self.fast_append_advance && append_only {
+                    snapshot
+                        .advance_append(&self.log_store, self.version)
+                        .await?;
+                } else {
+                    snapshot.update(&self.log_store, Some(self.version)).await?;
+                }
             }
 
             let mut state = DeltaTableState { snapshot };

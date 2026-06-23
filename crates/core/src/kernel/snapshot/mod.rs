@@ -289,6 +289,68 @@ impl Snapshot {
         }
     }
 
+    /// Advance an append-only commit to `target_version` cheaply: build the new
+    /// kernel snapshot (protocol/metadata/log-segment, one commit read) and
+    /// carry the existing materialized file batches forward, appending only a
+    /// freshly scanned batch for the files added since the current version.
+    /// O(files added), not O(active files).
+    ///
+    /// Correctness contract: the commits in `(current, target_version]` must add
+    /// files and remove none — carried-forward batches would otherwise retain
+    /// tombstoned files. Callers (the append-only post-commit hook) enforce this.
+    /// Falls back to [`update`](Self::update) when not materialized.
+    async fn advance_append(
+        self: Arc<Self>,
+        engine: Arc<dyn Engine>,
+        target_version: Version,
+    ) -> DeltaResult<Arc<Self>> {
+        let current_version = self.version();
+        let seed = match self.materialized_files().and_then(|m| m.full_table_seed()) {
+            Some(seed) if target_version > current_version => seed,
+            // Not materialized, or not a forward move — defer to the full path.
+            _ => return self.update(engine, Some(target_version)).await,
+        };
+
+        // New kernel snapshot at the target version (no file materialization).
+        let current = self.inner.clone();
+        let task_engine = engine.clone();
+        let inner = spawn_blocking_with_span(move || {
+            KernelSnapshot::builder_from(current)
+                .at_version(target_version)
+                .build(task_engine.as_ref())
+        })
+        .await
+        .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
+        let advanced = Arc::new(Self {
+            inner,
+            config: self.config.clone(),
+            materialized_files: None,
+        });
+
+        // Scan only the files added since `current_version` (empty existing
+        // data ⇒ the kernel emits just the delta), in the same FullPreserveRaw
+        // schema as the carried-forward batches.
+        let delta: Vec<RecordBatch> = advanced
+            .files_from_preserving_raw(
+                engine,
+                None,
+                current_version,
+                Box::new(std::iter::empty()),
+                None,
+            )
+            .try_collect()
+            .await?;
+
+        // Carry existing batches forward (cheap Arc clones) and append the delta.
+        let (_v, existing, _pred) = seed.into_parts();
+        let mut batches: Vec<RecordBatch> = existing.collect();
+        batches.extend(delta);
+        let materialized = Arc::new(MaterializedFiles::full(target_version, batches));
+        Ok(Arc::new(
+            advanced.with_materialized_files(Some(materialized)),
+        ))
+    }
+
     /// Rebuild a same-version snapshot if a checkpoint showed up after it was loaded.
     ///
     /// Version bumps still go through the normal snapshot update path.
@@ -1260,6 +1322,53 @@ impl EagerSnapshot {
             .into(),
         )
         .await
+    }
+
+    /// Materialize the active file list into memory if it isn't already, so
+    /// subsequent [`update`](Self::update)s replay only new commits instead of
+    /// re-scanning from the last checkpoint. One-time full replay; idempotent.
+    /// Restored-from-disk snapshots carry no materialized files (they aren't
+    /// serialized), so callers that persist/restore state must call this once
+    /// after load to keep steady-state commits incremental.
+    pub async fn ensure_materialized_files(&mut self, log_store: &dyn LogStore) -> DeltaResult<()> {
+        // `with_files` already no-ops when the file list is materialized.
+        *self = self.clone().with_files(log_store).await?;
+        Ok(())
+    }
+
+    /// Whether the active file list is materialized in memory (i.e. updates are
+    /// on the incremental path).
+    pub fn has_materialized_files(&self) -> bool {
+        self.snapshot.materialized_files().is_some()
+    }
+
+    /// Discard any materialized file list and rebuild it from the log/checkpoint
+    /// at the current version. Unlike [`ensure_materialized_files`](Self::ensure_materialized_files)
+    /// this always replays, so callers can periodically reconcile the in-memory
+    /// state against object-store truth and bound drift from incremental updates.
+    pub async fn rematerialize_files(&mut self, log_store: &dyn LogStore) -> DeltaResult<()> {
+        let mut inner = (*self.snapshot).clone();
+        inner.materialized_files = None;
+        inner.config.require_files = true;
+        *self = Self::try_new_with_snapshot(log_store, inner.into()).await?;
+        Ok(())
+    }
+
+    /// Cheaply advance an append-only commit to `version`. See
+    /// [`Snapshot::advance_append`]. Falls back to a full update when the
+    /// snapshot isn't materialized or the move isn't forward.
+    pub async fn advance_append(
+        &mut self,
+        log_store: &dyn LogStore,
+        version: Version,
+    ) -> DeltaResult<()> {
+        log_store.refresh().await?;
+        self.snapshot = self
+            .snapshot
+            .clone()
+            .advance_append(log_store.engine(None), version)
+            .await?;
+        Ok(())
     }
 
     /// Update the snapshot to the given version
@@ -2452,6 +2561,109 @@ mod tests {
             "expected updated file_views() to reuse materialized state, got {replay_ops:?}",
         );
 
+        Ok(())
+    }
+
+    /// The append-only fast advance must produce exactly the same active file
+    /// set as a full incremental update — otherwise reads would see a wrong
+    /// file list. Compares both paths on a real append transition (v1 → v2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn advance_append_matches_full_update() -> TestResult {
+        use crate::writer::test_utils::{
+            create_initialized_table, datafusion::write_batch, get_record_batch,
+        };
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_str().unwrap();
+        let table = create_initialized_table(path, &[]).await; // v0
+        let table = write_batch(table, get_record_batch(None, false)).await; // v1
+        let table = write_batch(table, get_record_batch(None, false)).await; // v2 (append-only)
+        let log_store = table.log_store();
+
+        let base = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        assert!(
+            base.has_materialized_files(),
+            "base must be materialized to exercise the fast path"
+        );
+
+        let mut fast = base.clone();
+        fast.advance_append(log_store.as_ref(), 2).await?;
+        let mut full = base.clone();
+        full.update(log_store.as_ref(), Some(2)).await?;
+
+        assert_eq!(fast.version(), 2);
+        assert_eq!(full.version(), 2);
+        assert!(
+            fast.has_materialized_files(),
+            "fast advance keeps the file list materialized"
+        );
+
+        let mut fast_paths: Vec<String> = fast
+            .file_views(log_store.as_ref(), None)
+            .map_ok(|f| f.path_raw().to_string())
+            .try_collect()
+            .await?;
+        let mut full_paths: Vec<String> = full
+            .file_views(log_store.as_ref(), None)
+            .map_ok(|f| f.path_raw().to_string())
+            .try_collect()
+            .await?;
+        fast_paths.sort();
+        full_paths.sort();
+        assert!(!fast_paths.is_empty());
+        assert_eq!(
+            fast_paths, full_paths,
+            "fast advance file set must equal full update file set"
+        );
+        Ok(())
+    }
+
+    /// `fast_append_advance` must be ignored for commits that carry Removes: the
+    /// post-commit hook falls back to the full update so removed files are
+    /// dropped, not retained by a blind append. An Overwrite commit under the
+    /// flag must yield the same file set as the authoritative full update.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fast_advance_falls_back_when_commit_removes_files() -> TestResult {
+        use crate::kernel::transaction::CommitProperties;
+        use crate::protocol::SaveMode;
+        use crate::writer::test_utils::{create_initialized_table, datafusion::write_batch, get_record_batch};
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_str().unwrap();
+        let table = create_initialized_table(path, &[]).await; // v0
+        let table = write_batch(table, get_record_batch(None, false)).await; // v1: file A
+
+        // Overwrite under the fast-advance flag → the commit carries Removes for
+        // v1's files, so the hook must take the full update, not the append path.
+        let table = table
+            .write(vec![get_record_batch(None, false)])
+            .with_save_mode(SaveMode::Overwrite)
+            .with_commit_properties(CommitProperties::default().with_fast_append_advance(true))
+            .await?;
+        assert_eq!(table.version(), Some(2));
+
+        let log_store = table.log_store();
+        let mut hook_paths: Vec<String> = table
+            .snapshot()?
+            .snapshot()
+            .file_views(log_store.as_ref(), None)
+            .map_ok(|f| f.path_raw().to_string())
+            .try_collect()
+            .await?;
+        // Authoritative full update from v1 → v2.
+        let mut truth = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        truth.update(log_store.as_ref(), Some(2)).await?;
+        let mut truth_paths: Vec<String> = truth
+            .file_views(log_store.as_ref(), None)
+            .map_ok(|f| f.path_raw().to_string())
+            .try_collect()
+            .await?;
+        hook_paths.sort();
+        truth_paths.sort();
+        assert_eq!(
+            hook_paths, truth_paths,
+            "Overwrite under fast-advance must drop removed files (hook fell back to full update)"
+        );
         Ok(())
     }
 
