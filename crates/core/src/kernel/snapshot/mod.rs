@@ -1371,6 +1371,40 @@ impl EagerSnapshot {
         Ok(())
     }
 
+    /// Catch up to the table's latest version cheaply *iff* the whole range
+    /// since the current version is append-only (no `Remove` actions): carry
+    /// the materialized file list forward and append only the new files,
+    /// instead of re-collecting the entire active set (the O(active files) cost
+    /// of a full [`update`](Self::update)).
+    ///
+    /// Returns `false` — signalling the caller to do a full update — when the
+    /// snapshot isn't materialized, isn't behind, is behind by more than
+    /// `max_gap` commits, or any commit in the range removes files (removes
+    /// can't be applied by a forward-only append, so a full reconcile is
+    /// required). The bounded gap keeps the per-commit Remove check (one log
+    /// read each) cheap.
+    pub async fn advance_appends_only(&mut self, log_store: &dyn LogStore, max_gap: u64) -> DeltaResult<bool> {
+        if !self.has_materialized_files() {
+            return Ok(false);
+        }
+        log_store.refresh().await?;
+        let current = self.version();
+        let target = log_store.get_latest_version(current).await?;
+        if target <= current || target - current > max_gap {
+            return Ok(false);
+        }
+        for v in (current + 1)..=target {
+            let Some(bytes) = log_store.read_commit_entry(v).await? else {
+                return Ok(false);
+            };
+            if crate::logstore::get_actions(v, &bytes)?.iter().any(|a| matches!(a, Action::Remove(_))) {
+                return Ok(false);
+            }
+        }
+        self.snapshot = self.snapshot.clone().advance_append(log_store.engine(None), target).await?;
+        Ok(true)
+    }
+
     /// Update the snapshot to the given version
     pub(crate) async fn update(
         &mut self,
@@ -2664,6 +2698,45 @@ mod tests {
             hook_paths, truth_paths,
             "Overwrite under fast-advance must drop removed files (hook fell back to full update)"
         );
+        Ok(())
+    }
+
+    /// The refresh fast-path: an append-only catch-up must match a full update,
+    /// and a range containing Removes must refuse (return false) so the caller
+    /// does the full reconcile.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn advance_appends_only_catches_up_and_guards_removes() -> TestResult {
+        use crate::kernel::transaction::CommitProperties;
+        use crate::protocol::SaveMode;
+        use crate::writer::test_utils::{create_initialized_table, datafusion::write_batch, get_record_batch};
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_str().unwrap();
+        let table = create_initialized_table(path, &[]).await; // v0
+        let table = write_batch(table, get_record_batch(None, false)).await; // v1
+        let table = write_batch(table, get_record_batch(None, false)).await; // v2 (append)
+        let log_store = table.log_store();
+
+        // Append-only catch-up v1 → v2 must succeed and match a full update.
+        let mut fast = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        assert!(fast.advance_appends_only(log_store.as_ref(), 64).await?, "append-only range must take the fast path");
+        assert_eq!(fast.version(), 2);
+        let mut full = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        full.update(log_store.as_ref(), Some(2)).await?;
+        let mut a: Vec<String> = fast.file_views(log_store.as_ref(), None).map_ok(|f| f.path_raw().to_string()).try_collect().await?;
+        let mut b: Vec<String> = full.file_views(log_store.as_ref(), None).map_ok(|f| f.path_raw().to_string()).try_collect().await?;
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "append-only catch-up must match full update");
+
+        // An Overwrite (carries Removes): a snapshot pinned before it must refuse.
+        table
+            .write(vec![get_record_batch(None, false)])
+            .with_save_mode(SaveMode::Overwrite)
+            .with_commit_properties(CommitProperties::default())
+            .await?; // v3 removes v1/v2 files
+        let mut guarded = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(2)).await?;
+        assert!(!guarded.advance_appends_only(log_store.as_ref(), 64).await?, "range with removes must fall back to full update");
         Ok(())
     }
 

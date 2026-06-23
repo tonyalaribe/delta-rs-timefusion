@@ -193,6 +193,17 @@ impl DeltaTableState {
         self.snapshot.rematerialize_files(log_store).await
     }
 
+    /// Catch up to the latest version by appending, iff the range is
+    /// append-only. Returns `false` when a full [`update`](Self::update) is
+    /// required instead. See [`EagerSnapshot::advance_appends_only`].
+    pub async fn advance_appends_only(
+        &mut self,
+        log_store: &dyn LogStore,
+        max_gap: u64,
+    ) -> Result<bool, DeltaTableError> {
+        self.snapshot.advance_appends_only(log_store, max_gap).await
+    }
+
     /// Get an [arrow::record_batch::RecordBatch] containing add action data.
     ///
     /// # Arguments
