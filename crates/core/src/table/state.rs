@@ -169,6 +169,42 @@ impl DeltaTableState {
         Ok(())
     }
 
+    /// Materialize the active file list once so later updates stay incremental.
+    /// See [`EagerSnapshot::ensure_materialized_files`]; needed after restoring
+    /// a persisted snapshot, whose materialized files aren't serialized.
+    pub async fn ensure_materialized_files(
+        &mut self,
+        log_store: &dyn LogStore,
+    ) -> Result<(), DeltaTableError> {
+        self.snapshot.ensure_materialized_files(log_store).await
+    }
+
+    /// Whether the active file list is materialized in memory.
+    pub fn has_materialized_files(&self) -> bool {
+        self.snapshot.has_materialized_files()
+    }
+
+    /// Rebuild the materialized file list from object-store truth, discarding
+    /// incremental state. See [`EagerSnapshot::rematerialize_files`].
+    pub async fn rematerialize_files(
+        &mut self,
+        log_store: &dyn LogStore,
+    ) -> Result<(), DeltaTableError> {
+        self.snapshot.rematerialize_files(log_store).await
+    }
+
+    /// Catch up to the latest version by carrying the materialized file list
+    /// forward (adds + removes), bounded by `max_gap`. Returns `false` when a
+    /// full [`update`](Self::update) is required instead. See
+    /// [`EagerSnapshot::advance_catchup`].
+    pub async fn advance_catchup(
+        &mut self,
+        log_store: &dyn LogStore,
+        max_gap: u64,
+    ) -> Result<bool, DeltaTableError> {
+        self.snapshot.advance_catchup(log_store, max_gap).await
+    }
+
     /// Get an [arrow::record_batch::RecordBatch] containing add action data.
     ///
     /// # Arguments

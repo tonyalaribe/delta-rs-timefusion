@@ -73,7 +73,7 @@
 //!       │                               │
 //!       └───────────────────────────────┘
 //!</pre>
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -506,6 +506,14 @@ pub struct PostCommitHookProperties {
     create_checkpoint: bool,
     /// Override the EnableExpiredLogCleanUp setting, if None config setting is used
     cleanup_expired_logs: Option<bool>,
+    /// Advance the post-commit snapshot incrementally: carry the materialized
+    /// file list forward, append the commit's added files (scan only the
+    /// delta), and drop its removed files (vectorized filter) — O(files added)
+    /// plus a cheap O(active files) columnar filter, rather than the O(active
+    /// files) stats re-materialize a full update pays. Handles append-only and
+    /// remove-bearing commits (compaction / `replace_where`). Falls back to a
+    /// full update when the snapshot isn't materialized.
+    incremental_advance: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -517,6 +525,7 @@ pub struct CommitProperties {
     max_retries: usize,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
+    pub(crate) incremental_advance: bool,
 }
 
 impl Default for CommitProperties {
@@ -527,6 +536,7 @@ impl Default for CommitProperties {
             max_retries: DEFAULT_RETRIES,
             create_checkpoint: true,
             cleanup_expired_logs: None,
+            incremental_advance: false,
         }
     }
 }
@@ -570,6 +580,13 @@ impl CommitProperties {
         self.cleanup_expired_logs = cleanup_expired_logs;
         self
     }
+
+    /// Enable the incremental post-commit snapshot advance (see
+    /// [`PostCommitHookProperties::incremental_advance`]).
+    pub fn with_incremental_advance(mut self, incremental_advance: bool) -> Self {
+        self.incremental_advance = incremental_advance;
+        self
+    }
 }
 
 impl From<CommitProperties> for CommitBuilder {
@@ -580,6 +597,7 @@ impl From<CommitProperties> for CommitBuilder {
             post_commit_hook: Some(PostCommitHookProperties {
                 create_checkpoint: value.create_checkpoint,
                 cleanup_expired_logs: value.cleanup_expired_logs,
+                incremental_advance: value.incremental_advance,
             }),
             app_transaction: value.app_transaction,
             ..Default::default()
@@ -795,6 +813,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                             data: this.data,
                             create_checkpoint: false,
                             cleanup_expired_logs: None,
+                            incremental_advance: false,
                             log_store: this.log_store,
                             table_data: None,
                             custom_execute_handler: this.post_commit_hook_handler,
@@ -935,6 +954,10 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                                     .post_commit
                                     .map(|v| v.cleanup_expired_logs)
                                     .unwrap_or_default(),
+                                incremental_advance: this
+                                    .post_commit
+                                    .map(|v| v.incremental_advance)
+                                    .unwrap_or_default(),
                                 log_store: this.log_store,
                                 table_data: Some(Box::new(read_snapshot)),
                                 custom_execute_handler: this.post_commit_hook_handler,
@@ -987,6 +1010,7 @@ pub struct PostCommit {
     pub data: CommitData,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
+    incremental_advance: bool,
     log_store: LogStoreRef,
     table_data: Option<Box<dyn TableReference>>,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
@@ -1000,7 +1024,28 @@ impl PostCommit {
             let post_commit_operation_id = Uuid::new_v4();
             let mut snapshot = table.eager_snapshot().clone();
             if self.version != snapshot.version() {
-                snapshot.update(&self.log_store, Some(self.version)).await?;
+                // Advance the materialized file list incrementally: carry it
+                // forward, append this commit's added files, and drop its
+                // removed ones — O(files added) + a cheap O(active files)
+                // columnar filter, instead of the full update's O(active files)
+                // stats re-materialize. The removed paths come straight from the
+                // committed actions (no log re-read).
+                if self.incremental_advance {
+                    let removed_paths: HashSet<String> = self
+                        .data
+                        .actions
+                        .iter()
+                        .filter_map(|a| match a {
+                            Action::Remove(remove) => Some(remove.path.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    snapshot
+                        .advance_with_removes(&self.log_store, self.version, &removed_paths)
+                        .await?;
+                } else {
+                    snapshot.update(&self.log_store, Some(self.version)).await?;
+                }
             }
 
             let mut state = DeltaTableState { snapshot };

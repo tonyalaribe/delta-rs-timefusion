@@ -8,7 +8,7 @@ use arrow_array::{Array, GenericByteViewArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
-use datafusion::common::{HashSet, Result};
+use datafusion::common::{DFSchema, HashSet, Result};
 use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
@@ -287,6 +287,44 @@ struct MatchingFilesScanSeed {
     delta_predicate: Arc<Predicate>,
 }
 
+/// Coerce each conjunct's literal types to the table column types and const-fold
+/// the casts that coercion inserts. The kernel's file-skipping evaluator rejects
+/// mismatched comparisons (`Date32 <op> Utf8View`) and the surrounding scan then
+/// fails open — skipping NOTHING and reading every file. Predicates parsed from
+/// SQL strings (e.g. TimeFusion's dedup `replace_where`) carry raw `Utf8View`
+/// literals, so without this they never prune. Terms that can't be coerced are
+/// passed through unchanged (still usable as row-level filters).
+fn coerce_skipping_terms(terms: Vec<Expr>, schema: &DFSchema, session: &dyn Session) -> Vec<Expr> {
+    use datafusion::logical_expr::simplify::SimplifyContext;
+    use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+
+    let execution_props = session.execution_props();
+    let context = SimplifyContext::builder()
+        .with_schema(Arc::new(schema.clone()))
+        .with_query_execution_start_time(execution_props.query_execution_start_time)
+        .with_config_options(
+            execution_props
+                .config_options()
+                .cloned()
+                .unwrap_or_else(|| session.config().options().clone()),
+        )
+        .build();
+    let simplifier = ExprSimplifier::new(context).with_max_cycles(10);
+    terms
+        .into_iter()
+        .map(|term| {
+            let mut coercer = TypeCoercionRewriter::new(schema);
+            let coerced = term
+                .clone()
+                .rewrite(&mut coercer)
+                .map(|t| t.data)
+                .unwrap_or(term);
+            simplifier.simplify(coerced.clone()).unwrap_or(coerced)
+        })
+        .collect()
+}
+
 async fn collect_matching_files(
     session: &dyn Session,
     snapshot: &EagerSnapshot,
@@ -301,7 +339,14 @@ async fn collect_matching_files(
             .metadata()
             .partition_columns(),
     )?;
-    let skipping_pred = analysis.simplified_terms.clone();
+    // Coerce literal types against the table schema so file-skipping can evaluate
+    // (and prune on) string-literal-vs-typed-column terms instead of failing open.
+    let skipping_pred = match DFSchema::try_from(snapshot.input_schema().as_ref().clone()) {
+        Ok(df_schema) => {
+            coerce_skipping_terms(analysis.simplified_terms.clone(), &df_schema, session)
+        }
+        Err(_) => analysis.simplified_terms.clone(),
+    };
     let delta_predicate = Arc::new(Predicate::and_from(
         skipping_pred
             .iter()
@@ -700,6 +745,7 @@ mod tests {
         test_utils::{
             TestResult, multibatch_add_actions_for_partition,
             object_store::{
+                RecordedObjectStoreOperation, RecordedPathKind,
                 drain_recorded_object_store_operations as drain_recorded_ops, recording_log_store,
             },
             open_fs_path,
@@ -855,6 +901,121 @@ mod tests {
         .await?;
         assert!(no_matches.is_empty());
 
+        Ok(())
+    }
+
+    /// Reproduces TimeFusion's dedup `replace_where` file-matching cost: a
+    /// predicate that mixes partition columns (`pid` Utf8, `day` Date32) with a
+    /// non-partition `ts` Timestamp, all as STRING literals (the only commit-able
+    /// form), must still PARTITION-PRUNE — reading only the target partition's
+    /// data files, not every file in the table. In prod this scanned all ~26k
+    /// files (`predicate_filtered=0`) per dedup commit. Pinned by counting
+    /// data-file reads through a recording object store.
+    #[tokio::test]
+    async fn find_files_partition_prunes_with_mixed_string_literal_predicate() -> TestResult {
+        use arrow::array::{Date32Array, TimestampMicrosecondArray};
+        use arrow::datatypes::TimeUnit;
+
+        use crate::kernel::StructType;
+
+        let cols = StructType::try_new(vec![
+            StructField::new("pid", DataType::Primitive(PrimitiveType::String), true),
+            StructField::new("day", DataType::Primitive(PrimitiveType::Date), true),
+            StructField::new("ts", DataType::Primitive(PrimitiveType::Timestamp), true),
+            StructField::new("val", DataType::Primitive(PrimitiveType::Long), true),
+        ])?;
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(cols.fields().cloned())
+            .with_partition_columns(["pid", "day"])
+            .await?;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("pid", ArrowDataType::Utf8, true),
+            Field::new("day", ArrowDataType::Date32, true),
+            Field::new(
+                "ts",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("val", ArrowDataType::Int64, true),
+        ]));
+        // day1 = 2026-01-01 (epoch day 20454), day2 = 2026-01-02 (20455).
+        let (day1, day2) = (20454_i32, 20455_i32);
+        let day1_ts0 = 1_767_225_600_000_000_i64; // 2026-01-01T00:00:00Z micros
+        let mk = |pid: &str, day: i32, ts: i64, val: i64| {
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![pid])),
+                    Arc::new(Date32Array::from(vec![day])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")),
+                    Arc::new(Int64Array::from(vec![val])),
+                ],
+            )
+            .unwrap()
+        };
+        // 4 files across 3 partitions: (a,day1)x2, (b,day1), (a,day2).
+        let mut table = table;
+        for b in [
+            mk("a", day1, day1_ts0, 1),
+            mk("a", day1, day1_ts0 + 60_000_000, 2),
+            mk("b", day1, day1_ts0, 3),
+            mk("a", day2, day1_ts0, 4),
+        ] {
+            table = table
+                .write(vec![b])
+                .with_save_mode(SaveMode::Append)
+                .await?;
+        }
+        assert_eq!(
+            table.get_file_uris()?.count(),
+            4,
+            "4 files across 3 partitions"
+        );
+
+        // Rebuild the snapshot through a recording store so we can count which
+        // data files the file-matching scan actually reads.
+        let (rec_store, mut ops) = recording_log_store(table.log_store());
+        let snapshot = EagerSnapshot::try_new(rec_store.as_ref(), Default::default(), None).await?;
+        let ctx = create_session().into_inner();
+        let session = ctx.state();
+        session.ensure_log_store_registered(rec_store.as_ref())?;
+        drain_recorded_ops(&mut ops).await;
+
+        // Dedup-shaped predicate, parsed from SQL the SAME way replace_where does
+        // (string literals against Utf8/Date32/Timestamp columns → coerced Expr).
+        // Hand-building Utf8 literals instead errors in the kernel
+        // ("Date32 <= Utf8View"); parsing applies the coercion prod actually runs.
+        let predicate = snapshot.parse_predicate_expression(
+            "pid = 'a' AND day = '2026-01-01' AND ts >= '2026-01-01 00:00:00' AND ts < '2026-01-02 00:00:00'",
+            &session,
+        )?;
+
+        let matched = find_files_scan(&snapshot, rec_store.clone(), &session, predicate).await?;
+        let data_reads = drain_recorded_ops(&mut ops)
+            .await
+            .into_iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    RecordedObjectStoreOperation::Get(RecordedPathKind::Data)
+                        | RecordedObjectStoreOperation::GetOpts(RecordedPathKind::Data)
+                        | RecordedObjectStoreOperation::GetRange(RecordedPathKind::Data, _)
+                        | RecordedObjectStoreOperation::GetRanges(RecordedPathKind::Data, _)
+                )
+            })
+            .count();
+
+        // Correctness: only the two (a, day1) files contain matching rows.
+        assert_eq!(matched.len(), 2, "two (a,day1) files match the predicate");
+        // Pruning: the scan must NOT read the (b,day1) or (a,day2) data files.
+        // Without partition pruning it reads all 4 — the prod predicate_filtered=0 bug.
+        assert!(
+            data_reads <= 2,
+            "file-matching scan read {data_reads} data files; expected ≤2 (partition pruning to (a,day1)). \
+             Reading all 4 means the typed-vs-string predicate defeated partition pruning."
+        );
         Ok(())
     }
 

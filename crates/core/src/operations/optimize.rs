@@ -954,7 +954,8 @@ impl MergePlan {
                 let actions = std::mem::take(&mut actions);
                 last_commit = now;
 
-                let mut properties = CommitProperties::default();
+                let mut properties = CommitProperties::default()
+                    .with_incremental_advance(commit_properties.incremental_advance);
                 properties.app_metadata = commit_properties.app_metadata.clone();
                 properties
                     .app_metadata
