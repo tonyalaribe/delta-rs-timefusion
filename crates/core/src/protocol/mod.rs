@@ -471,6 +471,19 @@ impl DeltaOperation {
             Self::Delete { predicate, .. } => predicate.clone(),
             Self::Update { predicate, .. } => predicate.clone(),
             Self::Merge { predicate, .. } => predicate.clone(),
+            // Optimize stores its partition filter as a JSON array of SQL
+            // predicate strings (PartitionFilter's Serialize, e.g.
+            // `["date = '2026-06-02'"]`). Without scoping the read here, the
+            // conflict checker treats compaction as a whole-table read, so a
+            // partition-scoped OPTIMIZE falsely conflicts with any concurrent
+            // data_change delete/dedup in *any* partition. Join the filters
+            // into one parseable predicate so the read is partition-scoped.
+            Self::Optimize { predicate, .. } => predicate.as_ref().and_then(|p| {
+                serde_json::from_str::<Vec<String>>(p)
+                    .ok()
+                    .filter(|preds| !preds.is_empty())
+                    .map(|preds| preds.join(" AND "))
+            }),
             _ => None,
         }
     }
@@ -546,6 +559,32 @@ mod tests {
 
     use super::*;
     use crate::kernel::Action;
+
+    #[test]
+    fn test_optimize_read_predicate_is_partition_scoped() {
+        use crate::{PartitionFilter, PartitionValue};
+
+        // Mirror how operations::optimize stores its filter: serde_json of the
+        // PartitionFilters, whose Serialize emits SQL strings.
+        let one = vec![PartitionFilter { key: "date".into(), value: PartitionValue::Equal("2026-06-02".into()) }];
+        let op = DeltaOperation::Optimize { predicate: serde_json::to_string(&one).ok(), target_size: 0 };
+        // Regression: previously returned None, so the conflict checker treated
+        // compaction as a whole-table read and falsely raised ConcurrentDeleteRead
+        // against dedups in unrelated partitions.
+        assert_eq!(op.read_predicate().as_deref(), Some("date = '2026-06-02'"));
+
+        // Multiple filters conjoin with AND.
+        let many = vec![
+            PartitionFilter { key: "date".into(), value: PartitionValue::Equal("2026-06-02".into()) },
+            PartitionFilter { key: "project_id".into(), value: PartitionValue::Equal("abc".into()) },
+        ];
+        let op_many = DeltaOperation::Optimize { predicate: serde_json::to_string(&many).ok(), target_size: 0 };
+        assert_eq!(op_many.read_predicate().as_deref(), Some("date = '2026-06-02' AND project_id = 'abc'"));
+
+        // No/empty filter ⇒ no predicate (genuine whole-table optimize).
+        assert_eq!(DeltaOperation::Optimize { predicate: None, target_size: 0 }.read_predicate(), None);
+        assert_eq!(DeltaOperation::Optimize { predicate: Some("[]".into()), target_size: 0 }.read_predicate(), None);
+    }
 
     #[test]
     fn test_load_table_stats() {
