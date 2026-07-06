@@ -499,6 +499,10 @@ pub struct DeltaScan {
     #[serde(skip)]
     read_operation_id: Option<Uuid>,
     file_selection: Option<FileSelection>,
+    /// Per-file row-ordinal selections keyed by table-relative parquet path. Purely an
+    /// optimization: files without an applicable selection are read in full.
+    #[serde(skip)]
+    row_ordinal_selections: Option<Arc<std::collections::HashMap<String, Vec<u64>>>>,
 }
 
 /// Deletion vector selection for one data file.
@@ -541,6 +545,7 @@ impl DeltaScan {
             log_store: None,
             read_operation_id: None,
             file_selection: None,
+            row_ordinal_selections: None,
         })
     }
 
@@ -568,6 +573,19 @@ impl DeltaScan {
     /// outside the table root, and missing selected files are reported there.
     pub fn with_file_selection(mut self, selection: FileSelection) -> Self {
         self.file_selection = Some(selection);
+        self
+    }
+
+    /// Attach per-file row-ordinal selections: global row indexes within each parquet file,
+    /// keyed by table-relative path (the same form [`FileSelection::from_file_paths`] accepts,
+    /// e.g. `part=x/part-000.parquet`). Matching files get a `ParquetAccessPlan` so the parquet
+    /// reader skips non-selected row groups and rows. Purely an optimization — non-matching
+    /// files, footer fetch failures, or out-of-range ordinals fall back to a full-file scan.
+    pub fn with_row_ordinal_selections(
+        mut self,
+        selections: std::collections::HashMap<String, Vec<u64>>,
+    ) -> Self {
+        self.row_ordinal_selections = Some(Arc::new(selections));
         self
     }
 
@@ -763,6 +781,7 @@ impl TableProvider for DeltaScan {
             engine,
             limit,
             resolved_file_selection.as_ref(),
+            self.row_ordinal_selections.as_deref(),
         )
         .await
     }

@@ -250,6 +250,7 @@ pub struct TableProviderBuilder {
     /// Predicates used only for file skipping in kernel log replay
     file_skipping_predicates: Option<Vec<Expr>>,
     file_selection: Option<next::FileSelection>,
+    row_ordinal_selections: Option<std::collections::HashMap<String, Vec<u64>>>,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -263,6 +264,7 @@ impl fmt::Debug for TableProviderBuilder {
             .field("table_version", &self.table_version)
             .field("file_skipping_predicates", &self.file_skipping_predicates)
             .field("file_selection", &self.file_selection)
+            .field("row_ordinal_selections", &self.row_ordinal_selections)
             .finish()
     }
 }
@@ -284,6 +286,7 @@ impl TableProviderBuilder {
             table_version: None,
             file_skipping_predicates: None,
             file_selection: None,
+            row_ordinal_selections: None,
         }
     }
 
@@ -371,6 +374,17 @@ impl TableProviderBuilder {
         self
     }
 
+    /// Attach per-file row-ordinal selections keyed by table-relative parquet path.
+    ///
+    /// See [`next::DeltaScan::with_row_ordinal_selections`].
+    pub fn with_row_ordinal_selections(
+        mut self,
+        selections: std::collections::HashMap<String, Vec<u64>>,
+    ) -> Self {
+        self.row_ordinal_selections = Some(selections);
+        self
+    }
+
     /// Consume the builder and resolve it into an executable [`next::DeltaScan`].
     pub async fn build(self) -> Result<next::DeltaScan> {
         let TableProviderBuilder {
@@ -382,6 +396,7 @@ impl TableProviderBuilder {
             table_version,
             file_skipping_predicates,
             file_selection,
+            row_ordinal_selections,
         } = self;
 
         let mut config = session
@@ -446,6 +461,10 @@ impl TableProviderBuilder {
 
         if let Some(selection) = file_selection {
             provider = provider.with_file_selection(selection);
+        }
+
+        if let Some(selections) = row_ordinal_selections {
+            provider = provider.with_row_ordinal_selections(selections);
         }
 
         Ok(provider)

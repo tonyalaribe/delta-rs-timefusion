@@ -38,7 +38,7 @@ use datafusion::{
     datasource::physical_plan::{
         ParquetSource,
         parquet::{
-            CachedParquetFileReaderFactory,
+            CachedParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
             metadata::{DFParquetMetadata, ordering_from_parquet_metadata},
         },
     },
@@ -111,6 +111,7 @@ pub(super) async fn execution_plan(
     engine: Arc<dyn Engine>,
     limit: Option<usize>,
     file_selection: Option<&ResolvedFileSelection>,
+    row_ordinal_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(selection) = file_selection
         && selection.active_file_ids.is_empty()
@@ -167,7 +168,7 @@ pub(super) async fn execution_plan(
         }
     }
 
-    get_data_scan_plan(session, scan_plan, replayed, limit).await
+    get_data_scan_plan(session, scan_plan, replayed, limit, row_ordinal_selections).await
 }
 
 /// Materialize deletion vector keep masks for every file in the scan that has one.
@@ -408,6 +409,7 @@ async fn get_data_scan_plan(
     scan_plan: KernelScanPlan,
     replayed: ReplayedScanFiles,
     limit: Option<usize>,
+    row_ordinal_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ReplayedScanFiles {
         files,
@@ -475,6 +477,7 @@ async fn get_data_scan_plan(
         limit,
         &file_id_field,
         predicate,
+        row_ordinal_selections,
     )
     .await?;
 
@@ -661,6 +664,10 @@ async fn get_read_plan(
     limit: Option<usize>,
     file_id_field: &FieldRef,
     predicate: Option<&Expr>,
+    // Optional per-file row-ordinal selections keyed by table-relative parquet path. Matching
+    // files get a `ParquetAccessPlan` attached so the parquet opener skips non-selected row
+    // groups/rows; all other files (and any fallback case) scan fully.
+    row_ordinal_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut plans = Vec::new();
 
@@ -675,7 +682,7 @@ async fn get_read_plan(
     let parquet_predicate_df_schema = parquet_predicate_schema.clone().to_dfschema()?;
     let adapter_factory = Arc::new(DefaultPhysicalExprAdapterFactory {});
 
-    for (store_url, files) in files_by_store.into_iter() {
+    for (store_url, mut files) in files_by_store.into_iter() {
         let object_store = state.runtime_env().object_store(&store_url)?;
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
         let reader_factory = Arc::new(CachedParquetFileReaderFactory::new(
@@ -750,6 +757,18 @@ async fn get_read_plan(
         )
         .await;
 
+        if let Some(selections) = row_ordinal_selections
+            && !selections.is_empty()
+        {
+            attach_row_ordinal_access_plans(
+                object_store.clone(),
+                metadata_cache.clone(),
+                &mut files,
+                selections,
+            )
+            .await;
+        }
+
         let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
@@ -821,6 +840,120 @@ async fn derive_common_ordering(
         }
     }
     common
+}
+
+/// Attach a [`ParquetAccessPlan`] to every file that has a row-ordinal selection so the parquet
+/// opener skips non-selected row groups/rows. Footer fetch failures or out-of-range ordinals
+/// leave the file untouched (plain full-file scan) — correctness never depends on the selection
+/// being applied; it is purely an optimization.
+async fn attach_row_ordinal_access_plans(
+    store: Arc<dyn ObjectStore>,
+    cache: Arc<dyn FileMetadataCache>,
+    files: &mut [(PartitionedFile, Option<Vec<bool>>)],
+    selections: &std::collections::HashMap<String, Vec<u64>>,
+) {
+    const FOOTER_FETCH_CONCURRENCY: usize = 16;
+    // Per-file futures own everything they touch (see `derive_common_ordering`): a closure over
+    // borrowed data is not lifetime-general and makes the parent scan future fail HRTB inference.
+    let matched: Vec<(usize, ObjectMeta, Vec<u64>)> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (file, dv))| {
+            // Deletion-vector keep-masks are consumed POSITIONALLY against the
+            // rows the reader emits (see consume_dv_mask); a row-skipping
+            // access plan would desynchronize the mask — deleted rows
+            // resurface. Same discipline as the predicate-pushdown guard on
+            // has_selection_vectors above: never combine the two.
+            if dv.is_some() {
+                return None;
+            }
+            let location = file.object_meta.location.as_ref();
+            selections
+                .iter()
+                .find(|(key, _)| path_matches_table_relative(location, key))
+                .map(|(_, ordinals)| (idx, file.object_meta.clone(), ordinals.clone()))
+        })
+        .collect();
+    let fetches = matched.into_iter().map(|(idx, object_meta, ordinals)| {
+        let (store, cache) = (store.clone(), cache.clone());
+        async move {
+            let meta = DFParquetMetadata::new(store.as_ref(), &object_meta)
+                .with_file_metadata_cache(Some(cache))
+                .fetch_metadata()
+                .await
+                .ok()?;
+            let rg_rows: Vec<i64> = meta.row_groups().iter().map(|rg| rg.num_rows()).collect();
+            access_plan_for_ordinals(&rg_rows, &ordinals).map(|plan| (idx, plan))
+        }
+    });
+    let plans: Vec<Option<(usize, ParquetAccessPlan)>> = futures::stream::iter(fetches)
+        .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    for (idx, plan) in plans.into_iter().flatten() {
+        files[idx].0.extensions.insert(plan);
+    }
+}
+
+/// Match a store-rooted object path against a table-relative parquet path, requiring the match
+/// to start on a full path-segment boundary.
+fn path_matches_table_relative(location: &str, key: &str) -> bool {
+    !key.is_empty()
+        && location.ends_with(key)
+        && (location.len() == key.len()
+            || location.as_bytes()[location.len() - key.len() - 1] == b'/')
+}
+
+/// Build a [`ParquetAccessPlan`] selecting exactly the given global row ordinals, given per
+/// row-group row counts. Row groups containing no ordinal are skipped entirely.
+///
+/// Returns `None` when any ordinal is out of range for the file; the caller then falls back to
+/// a plain full-file scan, so a selection can only ever over-select by whole-file fallback,
+/// never under-select.
+fn access_plan_for_ordinals(rg_row_counts: &[i64], ordinals: &[u64]) -> Option<ParquetAccessPlan> {
+    use parquet::arrow::arrow_reader::RowSelector;
+
+    let total_rows: u64 = rg_row_counts.iter().map(|&n| n.max(0) as u64).sum();
+    let mut ordinals = ordinals.to_vec();
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    if ordinals.last().is_some_and(|&ordinal| ordinal >= total_rows) {
+        return None;
+    }
+
+    let mut plan = ParquetAccessPlan::new_none(rg_row_counts.len());
+    let (mut offset, mut idx) = (0u64, 0usize);
+    for (rg_idx, &rg_rows) in rg_row_counts.iter().enumerate() {
+        let rg_rows = rg_rows.max(0) as u64;
+        let rg_end = offset + rg_rows;
+        let start = idx;
+        while idx < ordinals.len() && ordinals[idx] < rg_end {
+            idx += 1;
+        }
+        if idx > start {
+            let mut selectors: Vec<RowSelector> = Vec::new();
+            let mut cursor = 0u64;
+            for &ordinal in &ordinals[start..idx] {
+                let row = ordinal - offset;
+                if row > cursor {
+                    selectors.push(RowSelector::skip((row - cursor) as usize));
+                }
+                match selectors.last_mut() {
+                    Some(last) if !last.skip => last.row_count += 1,
+                    _ => selectors.push(RowSelector::select(1)),
+                }
+                cursor = row + 1;
+            }
+            if cursor < rg_rows {
+                selectors.push(RowSelector::skip((rg_rows - cursor) as usize));
+            }
+            // `scan_selection` is a no-op on `Skip` row groups (the `new_none` initial state),
+            // so set the selection access directly.
+            plan.set(rg_idx, RowGroupAccess::Selection(selectors.into()));
+        }
+        offset = rg_end;
+    }
+    Some(plan)
 }
 
 // Small helper to reuse some code between exec and exec_meta
@@ -952,6 +1085,59 @@ mod tests {
         assert_eq!(groups[1].len(), 1);
     }
 
+    #[test]
+    fn test_access_plan_for_ordinals() {
+        use parquet::arrow::arrow_reader::RowSelector;
+
+        // Row groups of 3 and 4 rows; ordinals {1, 5, 6} (unsorted input).
+        let plan = access_plan_for_ordinals(&[3, 4], &[5, 1, 6]).unwrap();
+        assert_eq!(
+            plan.inner(),
+            &[
+                // RG0: row 1 → skip 1, select 1, skip 1
+                RowGroupAccess::Selection(
+                    vec![
+                        RowSelector::skip(1),
+                        RowSelector::select(1),
+                        RowSelector::skip(1),
+                    ]
+                    .into()
+                ),
+                // RG1: rows {2, 3} → skip 2, select 2 (coalesced, no trailing skip)
+                RowGroupAccess::Selection(vec![RowSelector::skip(2), RowSelector::select(2)].into()),
+            ]
+        );
+
+        // Row group with no ordinals stays skipped.
+        let plan = access_plan_for_ordinals(&[3, 4], &[0]).unwrap();
+        assert_eq!(plan.inner()[1], RowGroupAccess::Skip);
+
+        // Out-of-range ordinal → no plan (whole-file fallback).
+        assert!(access_plan_for_ordinals(&[3, 4], &[7]).is_none());
+
+        // Empty ordinals select nothing.
+        let plan = access_plan_for_ordinals(&[3, 4], &[]).unwrap();
+        assert_eq!(plan.inner(), &[RowGroupAccess::Skip, RowGroupAccess::Skip]);
+    }
+
+    #[test]
+    fn test_path_matches_table_relative() {
+        assert!(path_matches_table_relative(
+            "timefusion/default/t/project_id=x/part-0.parquet",
+            "project_id=x/part-0.parquet"
+        ));
+        assert!(path_matches_table_relative(
+            "project_id=x/part-0.parquet",
+            "project_id=x/part-0.parquet"
+        ));
+        // Partial segment must not match.
+        assert!(!path_matches_table_relative(
+            "t/other_project_id=x/part-0.parquet",
+            "project_id=x/part-0.parquet"
+        ));
+        assert!(!path_matches_table_relative("t/part-0.parquet", ""));
+    }
+
     #[tokio::test]
     async fn test_resolve_empty_file_selection_does_not_poll_metadata_stream() -> TestResult {
         let log_store = TestTables::Simple.table_builder()?.build_storage()?;
@@ -1001,6 +1187,7 @@ mod tests {
             engine,
             None,
             Some(&selection),
+            None,
         )
         .await?;
 
@@ -1435,6 +1622,7 @@ mod tests {
             None,
             &file_id_field,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1457,6 +1645,7 @@ mod tests {
             &parquet_predicate_schema,
             Some(1),
             &file_id_field,
+            None,
             None,
         )
         .await?;
@@ -1485,6 +1674,7 @@ mod tests {
             &parquet_predicate_schema_extended,
             Some(1),
             &file_id_field,
+            None,
             None,
         )
         .await?;
@@ -1563,6 +1753,7 @@ mod tests {
             None,
             &file_id_field,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1600,6 +1791,7 @@ mod tests {
             &parquet_predicate_schema_extended,
             None,
             &file_id_field,
+            None,
             None,
         )
         .await?;
@@ -1699,6 +1891,7 @@ mod tests {
             None,
             &file_id_field,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1766,6 +1959,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1832,6 +2026,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1911,6 +2106,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1987,6 +2183,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2064,6 +2261,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2153,6 +2351,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
