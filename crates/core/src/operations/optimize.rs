@@ -261,13 +261,30 @@ impl Default for MetricDetails {
     }
 }
 
+/// A column to sort by in [`OptimizeType::SortBy`], with its direction.
+#[derive(Debug, Clone)]
+pub struct SortColumn {
+    /// Column name (top-level; nested struct paths use `.`).
+    pub column: String,
+    /// Sort descending when true, ascending when false.
+    pub descending: bool,
+    /// Order nulls first when true.
+    pub nulls_first: bool,
+}
+
 /// Type of optimization to perform.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OptimizeType {
     /// Compact files into pre-determined bins
     Compact,
     /// Z-order files based on provided columns
     ZOrder(Vec<String>),
+    /// Sort each partition's rows by the given columns (lexicographic), writing
+    /// globally-sorted files whose parquet footer honestly declares the order.
+    /// Unlike [`OptimizeType::Compact`] (which concatenates input files) the
+    /// output is truly sorted, so a reader can trust the footer `sorting_columns`
+    /// for ordering / limit pushdown. Whole-partition rewrite, like Z-order.
+    SortBy(Vec<SortColumn>),
 }
 
 /// Optimize a Delta table with given options
@@ -538,7 +555,11 @@ enum OptimizeOperations {
         Vec<String>,
         HashMap<String, (IndexMap<String, Scalar>, MergeBin)>,
     ),
-    // TODO: Sort
+    /// Plan to lexicographically sort each partition by the given columns
+    SortBy(
+        Vec<SortColumn>,
+        HashMap<String, (IndexMap<String, Scalar>, MergeBin)>,
+    ),
 }
 
 impl Default for OptimizeOperations {
@@ -808,6 +829,45 @@ impl MergePlan {
         Ok(stream)
     }
 
+    /// Datafusion-based lexicographic sort read (for [`OptimizeType::SortBy`]).
+    async fn read_sorted(
+        files: MergeBin,
+        context: Arc<SessionContext>,
+        scan_factory: SelectedFileScanFactory,
+        sort_columns: Arc<Vec<SortColumn>>,
+    ) -> Result<BoxStream<'static, Result<RecordBatch, ParquetError>>, DeltaTableError> {
+        use datafusion::functions::core::expr_ext::FieldAccessor;
+        use datafusion::logical_expr::ident;
+
+        let provider = scan_factory.provider_for(files.iter().cloned())?;
+        let df = context.read_table(Arc::new(provider))?;
+
+        let sort_exprs = sort_columns
+            .iter()
+            .map(|sc| {
+                let mut segments = sc.column.split('.');
+                let first = segments.next().expect("column name cannot be empty");
+                let mut expr = ident(first);
+                for segment in segments {
+                    expr = expr.field(segment);
+                }
+                // Expr::sort(asc, nulls_first): asc = !descending.
+                expr.sort(!sc.descending, sc.nulls_first)
+            })
+            .collect_vec();
+        let df = df.sort(sort_exprs)?;
+
+        let stream = df
+            .execute_stream()
+            .await?
+            .map_err(|err| {
+                ParquetError::General(format!("SortBy failed while scanning data: {err}"))
+            })
+            .boxed();
+
+        Ok(stream)
+    }
+
     /// Perform the operations outlined in the plan.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(operation = "optimize", version = snapshot.version()))]
@@ -901,6 +961,43 @@ impl MergePlan {
                             files.clone(),
                             exec_context.clone(),
                             scan_factory.clone(),
+                        );
+                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                            task_parameters.clone(),
+                            partition,
+                            files,
+                            log_store.object_store(Some(operation_id)),
+                            batch_stream,
+                            false,
+                        ));
+                        util::flatten_join_error(rewrite_result)
+                    })
+                    .buffer_unordered(max_concurrent_tasks)
+                    .boxed()
+            }
+            OptimizeOperations::SortBy(sort_columns, bins) => {
+                debug!("Starting sort with the columns: {sort_columns:?}");
+
+                let read_context = Arc::new(SessionContext::new_with_state(
+                    read_session.as_ref().clone(),
+                ));
+                let scan_factory = SelectedFileScanFactory::try_new(
+                    snapshot,
+                    log_store.clone(),
+                    read_session.as_ref(),
+                    Some(operation_id),
+                )?;
+                let task_parameters = self.task_parameters.clone();
+                let sort_columns = Arc::new(sort_columns);
+                let log_store = log_store.clone();
+
+                futures::stream::iter(bins)
+                    .map(move |(_, (partition, files))| {
+                        let batch_stream = Self::read_sorted(
+                            files.clone(),
+                            read_context.clone(),
+                            scan_factory.clone(),
+                            sort_columns.clone(),
                         );
                         let rewrite_result = tokio::task::spawn(Self::rewrite_files(
                             task_parameters.clone(),
@@ -1035,6 +1132,10 @@ pub async fn create_merge_plan(
                 filters,
             )
             .await?
+        }
+        OptimizeType::SortBy(sort_columns) => {
+            info!("building sort plan");
+            build_sort_plan(log_store, sort_columns, snapshot, partitions_keys, filters).await?
         }
     };
 
@@ -1402,6 +1503,73 @@ async fn build_zorder_plan(
         .max()
         .unwrap_or(0);
     let operation = OptimizeOperations::ZOrder(zorder_columns, partition_files);
+    Ok((
+        operation,
+        metrics,
+        PlannerStats::z_order(max_bin_span_files),
+    ))
+}
+
+/// Build a whole-partition sort plan: like [`build_zorder_plan`], one bin per
+/// partition (all files), but the rewrite sorts lexicographically by the given
+/// columns. Reuses the z-order planner stats (identical whole-partition,
+/// data_change=false rewrite semantics for conflict handling).
+async fn build_sort_plan(
+    log_store: &dyn LogStore,
+    sort_columns: Vec<SortColumn>,
+    snapshot: &EagerSnapshot,
+    partition_keys: &[String],
+    filters: &[PartitionFilter],
+) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
+    if sort_columns.is_empty() {
+        return Err(DeltaTableError::Generic(
+            "SortBy requires at least one column".to_string(),
+        ));
+    }
+    let sort_partition_cols = sort_columns
+        .iter()
+        .filter(|c| partition_keys.contains(&c.column))
+        .collect_vec();
+    if !sort_partition_cols.is_empty() {
+        return Err(DeltaTableError::Generic(format!(
+            "SortBy columns cannot be partition columns. Found: {sort_partition_cols:?}"
+        )));
+    }
+    for c in &sort_columns {
+        validate_zorder_column(snapshot.schema().as_ref(), &c.column)?;
+    }
+
+    let mut metrics = Metrics::default();
+    let mut partition_files: HashMap<String, (IndexMap<String, Scalar>, MergeBin)> = HashMap::new();
+
+    let predicate = if filters.is_empty() {
+        None
+    } else {
+        Some(Arc::new(to_kernel_predicate(
+            filters,
+            snapshot.schema().as_ref(),
+        )?))
+    };
+
+    let mut file_stream = snapshot.file_views(log_store, predicate);
+    while let Some(file) = file_stream.next().await {
+        let file = file?;
+        let add = file.to_add();
+        let partition_values = full_partition_values(snapshot, &add)?;
+        metrics.total_considered_files += 1;
+        partition_files
+            .entry(partition_values.hive_partition_path())
+            .or_insert_with(|| (partition_values, MergeBin::new()))
+            .1
+            .add(add);
+    }
+
+    let max_bin_span_files = partition_files
+        .values()
+        .map(|(_, bin)| bin.len())
+        .max()
+        .unwrap_or(0);
+    let operation = OptimizeOperations::SortBy(sort_columns, partition_files);
     Ok((
         operation,
         metrics,
