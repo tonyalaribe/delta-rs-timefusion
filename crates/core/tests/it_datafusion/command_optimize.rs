@@ -19,7 +19,7 @@ use deltalake_core::logstore::{
     CommitOrBytes, LogStore, LogStoreConfig, LogStoreRef, ObjectStoreRef, get_actions,
 };
 use deltalake_core::operations::optimize::{
-    MetricDetails, Metrics, OptimizeType, PlannerStrategy, create_merge_plan,
+    MetricDetails, Metrics, OptimizeType, PlannerStrategy, SortColumn, create_merge_plan,
 };
 use deltalake_core::protocol::DeltaOperation;
 use deltalake_core::test_utils::TestTables;
@@ -308,6 +308,12 @@ async fn assert_optimize_preserves_live_rows_with_deletion_vectors(
                 .with_type(OptimizeType::ZOrder(columns))
                 .await?
         }
+        OptimizeType::SortBy(columns) => {
+            table
+                .optimize()
+                .with_type(OptimizeType::SortBy(columns))
+                .await?
+        }
     };
 
     assert_eq!(metrics.num_files_added, 1);
@@ -507,6 +513,60 @@ async fn test_optimize_non_partitioned_table() -> Result<(), Box<dyn Error>> {
     let parameters = last_commit.operation_parameters.clone().unwrap();
     assert_eq!(parameters["targetSize"], json!("2000000"));
     assert_eq!(parameters["predicate"], "[]");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimize_sortby_rerun_is_near_noop() -> Result<(), Box<dyn Error>> {
+    // Regression: SortBy used to dump every file in a partition into one bin and
+    // rewrite the whole (growing) partition on every run, so a periodic sorted
+    // compactor could never converge on a busy table. It must now bin-pack and
+    // prune single-file bins like Compact — a re-run over an already-sorted
+    // partition rewrites nothing.
+    let context = setup_test(false).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+
+    for i in 0..4 {
+        write(
+            &mut writer,
+            &mut dt,
+            tuples_to_batch(vec![(i, i + 1), (i, i + 2), (i, i + 3)], "2022-05-22")?,
+        )
+        .await?;
+    }
+    assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 4);
+
+    let sort = vec![SortColumn {
+        column: "x".into(),
+        descending: false,
+        nulls_first: false,
+    }];
+    let target = NonZeroU64::new(2_000_000).unwrap();
+
+    // First run: the four small files bin-pack into one sorted file.
+    let (dt, m1) = dt
+        .optimize()
+        .with_type(OptimizeType::SortBy(sort.clone()))
+        .with_target_size(target)
+        .await?;
+    assert_eq!(m1.num_files_removed, 4);
+    assert_eq!(m1.num_files_added, 1);
+    assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 1);
+
+    // Second run: the lone file is a single-file bin → pruned, nothing rewritten.
+    let (dt, m2) = dt
+        .optimize()
+        .with_type(OptimizeType::SortBy(sort))
+        .with_target_size(target)
+        .await?;
+    assert_eq!(
+        m2.num_files_removed, 0,
+        "re-run must not rewrite already-sorted files"
+    );
+    assert_eq!(m2.num_files_added, 0);
+    assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 1);
 
     Ok(())
 }

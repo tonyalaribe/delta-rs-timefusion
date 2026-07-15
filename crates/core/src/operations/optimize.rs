@@ -555,10 +555,16 @@ enum OptimizeOperations {
         Vec<String>,
         HashMap<String, (IndexMap<String, Scalar>, MergeBin)>,
     ),
-    /// Plan to lexicographically sort each partition by the given columns
+    /// Plan to lexicographically sort files by the given columns.
+    ///
+    /// Like [`OptimizeType::Compact`], files are bin-packed in stable order up
+    /// to the target size and already-large files are skipped — so a re-run
+    /// over an already-sorted partition rewrites almost nothing. Each bin is
+    /// sorted independently on write, keeping per-run cost bounded to the
+    /// newly-flushed small files rather than the whole (growing) partition.
     SortBy(
         Vec<SortColumn>,
-        HashMap<String, (IndexMap<String, Scalar>, MergeBin)>,
+        HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)>,
     ),
 }
 
@@ -992,7 +998,10 @@ impl MergePlan {
                 let log_store = log_store.clone();
 
                 futures::stream::iter(bins)
-                    .map(move |(_, (partition, files))| {
+                    .flat_map(|(_, (partition, bins))| {
+                        futures::stream::iter(bins).map(move |bin| (partition.clone(), bin))
+                    })
+                    .map(move |(partition, files)| {
                         let batch_stream = Self::read_sorted(
                             files.clone(),
                             read_context.clone(),
@@ -1005,11 +1014,13 @@ impl MergePlan {
                             files,
                             log_store.object_store(Some(operation_id)),
                             batch_stream,
-                            false,
+                            // Bins are pre-packed to <= target_size, so each
+                            // writes one sorted output file (no re-split).
+                            true,
                         ));
                         util::flatten_join_error(rewrite_result)
                     })
-                    .buffer_unordered(max_concurrent_tasks)
+                    .buffered(max_concurrent_tasks)
                     .boxed()
             }
         };
@@ -1135,7 +1146,7 @@ pub async fn create_merge_plan(
         }
         OptimizeType::SortBy(sort_columns) => {
             info!("building sort plan");
-            build_sort_plan(log_store, sort_columns, snapshot, partitions_keys, filters).await?
+            build_sort_plan(log_store, sort_columns, snapshot, partitions_keys, filters, target_size).await?
         }
     };
 
@@ -1520,6 +1531,7 @@ async fn build_sort_plan(
     snapshot: &EagerSnapshot,
     partition_keys: &[String],
     filters: &[PartitionFilter],
+    target_size: NonZeroU64,
 ) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
     if sort_columns.is_empty() {
         return Err(DeltaTableError::Generic(
@@ -1539,8 +1551,11 @@ async fn build_sort_plan(
         validate_zorder_column(snapshot.schema().as_ref(), &c.column)?;
     }
 
+    type PartitionFileEntry = (IndexMap<String, Scalar>, usize, Vec<OrderedFileCandidate>);
+
     let mut metrics = Metrics::default();
-    let mut partition_files: HashMap<String, (IndexMap<String, Scalar>, MergeBin)> = HashMap::new();
+    let mut planner_stats = PlannerStats::preserve_locality();
+    let mut partition_files: HashMap<String, PartitionFileEntry> = HashMap::new();
 
     let predicate = if filters.is_empty() {
         None
@@ -1551,30 +1566,60 @@ async fn build_sort_plan(
         )?))
     };
 
+    // Same file selection as `build_compaction_plan`: newest-first, skip files
+    // already at/above target_size so an already-sorted partition re-runs to a
+    // near no-op. The only difference is each bin is sorted (not just
+    // concatenated) on write — see the SortBy arm in `execute`.
     let mut file_stream = snapshot.file_views(log_store, predicate);
     while let Some(file) = file_stream.next().await {
         let file = file?;
+        metrics.total_considered_files += 1;
+        let object_meta = ObjectMeta::try_from(&file)?;
         let add = file.to_add();
         let partition_values = full_partition_values(snapshot, &add)?;
-        metrics.total_considered_files += 1;
-        partition_files
+        let entry = partition_files
             .entry(partition_values.hive_partition_path())
-            .or_insert_with(|| (partition_values, MergeBin::new()))
-            .1
-            .add(add);
+            .or_insert_with(|| (partition_values, 0, vec![]));
+        let stable_ordinal = entry.1;
+        entry.1 += 1;
+
+        if object_meta.size > target_size.get() {
+            metrics.total_files_skipped += 1;
+            continue;
+        }
+
+        entry.2.push(OrderedFileCandidate {
+            add,
+            stable_ordinal,
+            size_bytes: object_meta.size,
+        });
     }
 
-    let max_bin_span_files = partition_files
-        .values()
-        .map(|(_, bin)| bin.len())
-        .max()
-        .unwrap_or(0);
-    let operation = OptimizeOperations::SortBy(sort_columns, partition_files);
-    Ok((
-        operation,
-        metrics,
-        PlannerStats::z_order(max_bin_span_files),
-    ))
+    let mut operations: HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)> = HashMap::new();
+    for (part, (partition, _, files)) in partition_files {
+        let (merge_bins, partition_stats) =
+            plan_compaction_bins_in_stable_order(files, target_size.get());
+        planner_stats.absorb(&partition_stats);
+        operations.insert(part, (partition, merge_bins));
+    }
+
+    // Drop single-file bins: a lone file is already sorted (prior run) and
+    // rewriting it changes nothing but its name.
+    for (_, (_, bins)) in operations.iter_mut() {
+        bins.retain(|bin| {
+            if bin.len() == 1 {
+                metrics.total_files_skipped += 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    operations.retain(|_, (_, bins)| !bins.is_empty());
+    metrics.partitions_optimized = operations.len() as u64;
+
+    let operation = OptimizeOperations::SortBy(sort_columns, operations);
+    Ok((operation, metrics, planner_stats))
 }
 
 #[cfg(test)]
