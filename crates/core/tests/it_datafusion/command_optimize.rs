@@ -208,6 +208,35 @@ fn single_int_batch(values: Vec<i32>) -> Result<RecordBatch, Box<dyn Error>> {
     )?)
 }
 
+async fn sorted_xy_values(table: &DeltaTable) -> Result<Vec<(i32, i32)>, Box<dyn Error>> {
+    let ctx: SessionContext = DeltaSessionContext::default().into();
+    table.update_datafusion_session(&ctx.state())?;
+    ctx.register_table("delta_table", table.table_provider().await?)?;
+
+    let batches = ctx
+        .sql("SELECT x, y FROM delta_table ORDER BY x, y")
+        .await?
+        .collect()
+        .await?;
+    let mut values = Vec::new();
+    for batch in batches {
+        let x = batch
+            .column_by_name("x")
+            .ok_or_else(|| std::io::Error::other("missing x column"))?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| std::io::Error::other("x column is not Int32"))?;
+        let y = batch
+            .column_by_name("y")
+            .ok_or_else(|| std::io::Error::other("missing y column"))?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| std::io::Error::other("y column is not Int32"))?;
+        values.extend((0..batch.num_rows()).map(|i| (x.value(i), y.value(i))));
+    }
+    Ok(values)
+}
+
 async fn sorted_int_values(table: &DeltaTable) -> Result<Vec<i32>, Box<dyn Error>> {
     let ctx: SessionContext = DeltaSessionContext::default().into();
     table.update_datafusion_session(&ctx.state())?;
@@ -312,6 +341,12 @@ async fn assert_optimize_preserves_live_rows_with_deletion_vectors(
             table
                 .optimize()
                 .with_type(OptimizeType::SortBy(columns))
+                .await?
+        }
+        OptimizeType::SortByDedup(columns, dedup) => {
+            table
+                .optimize()
+                .with_type(OptimizeType::SortByDedup(columns, dedup))
                 .await?
         }
     };
@@ -568,6 +603,52 @@ async fn test_optimize_sortby_rerun_is_near_noop() -> Result<(), Box<dyn Error>>
     assert_eq!(m2.num_files_added, 0);
     assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimize_sortby_dedup_keeps_greatest_tiebreak_across_files()
+-> Result<(), Box<dyn Error>> {
+    let context = setup_test(false).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 10), (2, 20)], "2022-05-22")?,
+    )
+    .await?;
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 30), (3, 40)], "2022-05-22")?,
+    )
+    .await?;
+
+    let sort = vec![SortColumn {
+        column: "x".into(),
+        descending: false,
+        nulls_first: false,
+    }];
+    let dedup = deltalake_core::operations::optimize::DedupConfig {
+        columns: vec!["x".into()],
+        tiebreak: Some(SortColumn {
+            column: "y".into(),
+            descending: true,
+            nulls_first: false,
+        }),
+    };
+    let (dt, metrics) = dt
+        .optimize()
+        .with_type(OptimizeType::SortByDedup(sort, dedup))
+        .with_target_size(NonZeroU64::new(2_000_000).unwrap())
+        .await?;
+
+    assert_eq!(metrics.num_files_removed, 2);
+    assert_eq!(
+        sorted_xy_values(&dt).await?,
+        vec![(1, 30), (2, 20), (3, 40)]
+    );
     Ok(())
 }
 

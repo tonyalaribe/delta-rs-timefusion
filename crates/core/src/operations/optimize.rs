@@ -272,6 +272,19 @@ pub struct SortColumn {
     pub nulls_first: bool,
 }
 
+/// Streaming deduplication configuration for [`OptimizeType::SortByDedup`].
+///
+/// Rows with equal `columns` must be consecutive under the requested sort
+/// columns. `tiebreak`, when set, is appended to that sort and makes the first
+/// row in each group the deterministic survivor.
+#[derive(Debug, Clone)]
+pub struct DedupConfig {
+    /// Columns forming the duplicate identity.
+    pub columns: Vec<String>,
+    /// Optional descending/ascending winner selector appended to the sort.
+    pub tiebreak: Option<SortColumn>,
+}
+
 /// Type of optimization to perform.
 #[derive(Debug, Clone)]
 pub enum OptimizeType {
@@ -285,6 +298,9 @@ pub enum OptimizeType {
     /// output is truly sorted, so a reader can trust the footer `sorting_columns`
     /// for ordering / limit pushdown. Whole-partition rewrite, like Z-order.
     SortBy(Vec<SortColumn>),
+    /// Like [`OptimizeType::SortBy`], but drops consecutive rows matching the
+    /// configured dedup key while streaming the sorted output to parquet.
+    SortByDedup(Vec<SortColumn>, DedupConfig),
 }
 
 /// Optimize a Delta table with given options
@@ -564,6 +580,11 @@ enum OptimizeOperations {
     /// newly-flushed small files rather than the whole (growing) partition.
     SortBy(
         Vec<SortColumn>,
+        HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)>,
+    ),
+    SortByDedup(
+        Vec<SortColumn>,
+        DedupConfig,
         HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)>,
     ),
 }
@@ -874,6 +895,79 @@ impl MergePlan {
         Ok(stream)
     }
 
+    fn dedup_sorted(stream: ParquetReadStream, columns: Arc<Vec<String>>) -> ParquetReadStream {
+        use arrow::array::BooleanArray;
+        use arrow::compute::filter_record_batch;
+        use arrow::row::{OwnedRow, RowConverter, SortField};
+
+        futures::stream::try_unfold(
+            (stream, None, None),
+            move |(mut stream, mut converter, mut previous): (
+                ParquetReadStream,
+                Option<(Vec<usize>, RowConverter)>,
+                Option<OwnedRow>,
+            )| {
+                let columns = Arc::clone(&columns);
+                async move {
+                    loop {
+                        let Some(batch) = stream.try_next().await? else {
+                            return Ok(None);
+                        };
+                        let (indexes, row_converter) = match converter.take() {
+                            Some(converter) => converter,
+                            None => {
+                                let indexes = columns
+                                    .iter()
+                                    .map(|column| {
+                                        batch.schema().index_of(column).map_err(|e| {
+                                            ParquetError::General(format!(
+                                                "SortByDedup key `{column}` missing: {e}"
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let fields = indexes
+                                    .iter()
+                                    .map(|&i| SortField::new(batch.column(i).data_type().clone()))
+                                    .collect::<Vec<_>>();
+                                (
+                                    indexes,
+                                    RowConverter::new(fields).map_err(|e| {
+                                        ParquetError::General(format!(
+                                            "SortByDedup key conversion: {e}"
+                                        ))
+                                    })?,
+                                )
+                            }
+                        };
+                        let key_columns = indexes
+                            .iter()
+                            .map(|&i| batch.column(i).clone())
+                            .collect::<Vec<_>>();
+                        let rows = row_converter.convert_columns(&key_columns).map_err(|e| {
+                            ParquetError::General(format!("SortByDedup key conversion: {e}"))
+                        })?;
+                        let mut keep = Vec::with_capacity(batch.num_rows());
+                        for i in 0..batch.num_rows() {
+                            let row = rows.row(i).owned();
+                            keep.push(previous.as_ref() != Some(&row));
+                            previous = Some(row);
+                        }
+                        converter = Some((indexes, row_converter));
+                        if keep.iter().any(|&keep| keep) {
+                            let batch = filter_record_batch(&batch, &BooleanArray::from(keep))
+                                .map_err(|e| {
+                                    ParquetError::General(format!("SortByDedup filter: {e}"))
+                                })?;
+                            return Ok(Some((batch, (stream, converter, previous))));
+                        }
+                    }
+                }
+            },
+        )
+        .boxed()
+    }
+
     /// Perform the operations outlined in the plan.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(operation = "optimize", version = snapshot.version()))]
@@ -1023,6 +1117,57 @@ impl MergePlan {
                     .buffered(max_concurrent_tasks)
                     .boxed()
             }
+            OptimizeOperations::SortByDedup(sort_columns, dedup, bins) => {
+                debug!("Starting deduplicating sort with the columns: {sort_columns:?}");
+                let read_context = Arc::new(SessionContext::new_with_state(
+                    read_session.as_ref().clone(),
+                ));
+                let scan_factory = SelectedFileScanFactory::try_new(
+                    snapshot,
+                    log_store.clone(),
+                    read_session.as_ref(),
+                    Some(operation_id),
+                )?;
+                let task_parameters = self.task_parameters.clone();
+                let mut sort_columns = sort_columns;
+                if let Some(tiebreak) = &dedup.tiebreak
+                    && !sort_columns
+                        .iter()
+                        .any(|column| column.column == tiebreak.column)
+                {
+                    sort_columns.push(tiebreak.clone());
+                }
+                let sort_columns = Arc::new(sort_columns);
+                let dedup_columns = Arc::new(dedup.columns);
+                let log_store = log_store.clone();
+
+                futures::stream::iter(bins)
+                    .flat_map(|(_, (partition, bins))| {
+                        futures::stream::iter(bins).map(move |bin| (partition.clone(), bin))
+                    })
+                    .map(move |(partition, files)| {
+                        let read = Self::read_sorted(
+                            files.clone(),
+                            read_context.clone(),
+                            scan_factory.clone(),
+                            sort_columns.clone(),
+                        );
+                        let columns = dedup_columns.clone();
+                        let batch_stream =
+                            async move { Ok(Self::dedup_sorted(read.await?, columns)) };
+                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                            task_parameters.clone(),
+                            partition,
+                            files,
+                            log_store.object_store(Some(operation_id)),
+                            batch_stream,
+                            true,
+                        ));
+                        util::flatten_join_error(rewrite_result)
+                    })
+                    .buffered(max_concurrent_tasks)
+                    .boxed()
+            }
         };
 
         let mut table =
@@ -1146,7 +1291,29 @@ pub async fn create_merge_plan(
         }
         OptimizeType::SortBy(sort_columns) => {
             info!("building sort plan");
-            build_sort_plan(log_store, sort_columns, snapshot, partitions_keys, filters, target_size).await?
+            build_sort_plan(
+                log_store,
+                sort_columns,
+                None,
+                snapshot,
+                partitions_keys,
+                filters,
+                target_size,
+            )
+            .await?
+        }
+        OptimizeType::SortByDedup(sort_columns, dedup) => {
+            info!("building deduplicating sort plan");
+            build_sort_plan(
+                log_store,
+                sort_columns,
+                Some(dedup),
+                snapshot,
+                partitions_keys,
+                filters,
+                target_size,
+            )
+            .await?
         }
     };
 
@@ -1528,6 +1695,7 @@ async fn build_zorder_plan(
 async fn build_sort_plan(
     log_store: &dyn LogStore,
     sort_columns: Vec<SortColumn>,
+    dedup: Option<DedupConfig>,
     snapshot: &EagerSnapshot,
     partition_keys: &[String],
     filters: &[PartitionFilter],
@@ -1549,6 +1717,19 @@ async fn build_sort_plan(
     }
     for c in &sort_columns {
         validate_zorder_column(snapshot.schema().as_ref(), &c.column)?;
+    }
+    if let Some(dedup) = &dedup {
+        if dedup.columns.is_empty() {
+            return Err(DeltaTableError::Generic(
+                "SortByDedup requires at least one dedup column".to_string(),
+            ));
+        }
+        for column in &dedup.columns {
+            validate_zorder_column(snapshot.schema().as_ref(), column)?;
+        }
+        if let Some(tiebreak) = &dedup.tiebreak {
+            validate_zorder_column(snapshot.schema().as_ref(), &tiebreak.column)?;
+        }
     }
 
     type PartitionFileEntry = (IndexMap<String, Scalar>, usize, Vec<OrderedFileCandidate>);
@@ -1618,7 +1799,10 @@ async fn build_sort_plan(
     operations.retain(|_, (_, bins)| !bins.is_empty());
     metrics.partitions_optimized = operations.len() as u64;
 
-    let operation = OptimizeOperations::SortBy(sort_columns, operations);
+    let operation = match dedup {
+        Some(dedup) => OptimizeOperations::SortByDedup(sort_columns, dedup, operations),
+        None => OptimizeOperations::SortBy(sort_columns, operations),
+    };
     Ok((operation, metrics, planner_stats))
 }
 
@@ -1964,7 +2148,7 @@ pub(super) mod zorder {
                 let schema = Arc::new(ArrowSchema::new(vec![
                     Field::new("moDified", DataType::Utf8, true),
                     Field::new("ID", DataType::Utf8, true),
-                    Field::new("vaLue", DataType::Int32, true),
+                    Field::new("vaLUE", DataType::Int32, true),
                 ]));
 
                 let batch = RecordBatch::try_new(
