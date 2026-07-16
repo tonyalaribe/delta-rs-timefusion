@@ -698,10 +698,7 @@ async fn get_read_plan(
             .map(|(file, _)| file.object_meta.location.as_ref())
             .collect::<Vec<_>>()
             .join(",");
-        let span = tracing::Span::current();
-        span.record("parquet.files", file_count as i64);
-        span.record("parquet.bytes", planned_bytes as i64);
-        span.record("parquet.file_ids", &file_ids);
+        let _parquet_span = parquet_plan_span(file_count, planned_bytes, &file_ids);
         let reader_factory = Arc::new(
             crate::delta_datafusion::parquet_metrics::InstrumentedParquetFileReaderFactory::new(
                 object_store.clone(),
@@ -920,8 +917,19 @@ async fn attach_row_ordinal_access_plans(
         selected.push(format!("{file}:{row_groups:?}"));
         files[idx].0.extensions.insert(plan);
     }
-    let span = tracing::Span::current();
-    span.record("parquet.selected_row_groups", &selected.join(","));
+    let _row_selection_span = tracing::info_span!(
+        "delta.parquet.row_selection",
+        parquet.selected_row_groups = %selected.join(",")
+    );
+}
+
+fn parquet_plan_span(file_count: usize, planned_bytes: u64, file_ids: &str) -> tracing::Span {
+    tracing::info_span!(
+        "delta.parquet.plan",
+        parquet.files = file_count as i64,
+        parquet.bytes = planned_bytes as i64,
+        parquet.file_ids = file_ids,
+    )
 }
 
 fn row_groups_for_ordinals(rg_row_counts: &[i64], ordinals: &[u64]) -> Option<Vec<usize>> {
@@ -1130,6 +1138,15 @@ mod tests {
     };
 
     use super::{plan::build_parquet_predicate_schema, *};
+
+    #[test]
+    fn parquet_plan_span_declares_exported_fields() {
+        let span = parquet_plan_span(2, 1024, "first.parquet,second.parquet");
+        let fields = span.metadata().unwrap().fields();
+        for field in ["parquet.files", "parquet.bytes", "parquet.file_ids"] {
+            assert!(fields.field(field).is_some(), "missing {field}");
+        }
+    }
 
     #[test]
     fn test_partitioned_files_to_file_groups_respects_dictionary_cardinality_limit() {
