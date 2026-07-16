@@ -38,7 +38,7 @@ use datafusion::{
     datasource::physical_plan::{
         ParquetSource,
         parquet::{
-            CachedParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
+            ParquetAccessPlan, RowGroupAccess,
             metadata::{DFParquetMetadata, ordering_from_parquet_metadata},
         },
     },
@@ -684,11 +684,30 @@ async fn get_read_plan(
 
     for (store_url, mut files) in files_by_store.into_iter() {
         let object_store = state.runtime_env().object_store(&store_url)?;
-        let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
-        let reader_factory = Arc::new(CachedParquetFileReaderFactory::new(
-            object_store.clone(),
-            metadata_cache.clone(),
-        ));
+        let metadata_cache: Arc<dyn FileMetadataCache> = Arc::new(
+            crate::delta_datafusion::parquet_metrics::InstrumentedFileMetadataCache::new(
+                state.runtime_env().cache_manager.get_file_metadata_cache(),
+            ),
+        );
+        let file_count = files.len();
+        let planned_bytes: u64 = files.iter().map(|(file, _)| file.object_meta.size).sum();
+        crate::delta_datafusion::parquet_metrics::record_scan(file_count, planned_bytes);
+        let file_ids = files
+            .iter()
+            .take(8)
+            .map(|(file, _)| file.object_meta.location.as_ref())
+            .collect::<Vec<_>>()
+            .join(",");
+        let span = tracing::Span::current();
+        span.record("parquet.files", file_count as i64);
+        span.record("parquet.bytes", planned_bytes as i64);
+        span.record("parquet.file_ids", &file_ids);
+        let reader_factory = Arc::new(
+            crate::delta_datafusion::parquet_metrics::InstrumentedParquetFileReaderFactory::new(
+                object_store.clone(),
+                metadata_cache.clone(),
+            ),
+        );
 
         // NOTE: In the "next" provider, DataFusion's Parquet scan partition fields are file-id
         // only. Delta partition columns/values are injected via kernel transforms and handled
@@ -821,7 +840,9 @@ async fn derive_common_ordering(
                 .fetch_metadata()
                 .await
                 .ok()?;
-            ordering_from_parquet_metadata(&meta, &read_schema).ok().flatten()
+            ordering_from_parquet_metadata(&meta, &read_schema)
+                .ok()
+                .flatten()
         }
     });
     let orderings: Vec<Option<LexOrdering>> = futures::stream::iter(fetches)
@@ -883,16 +904,50 @@ async fn attach_row_ordinal_access_plans(
                 .await
                 .ok()?;
             let rg_rows: Vec<i64> = meta.row_groups().iter().map(|rg| rg.num_rows()).collect();
-            access_plan_for_ordinals(&rg_rows, &ordinals).map(|plan| (idx, plan))
+            let row_groups = row_groups_for_ordinals(&rg_rows, &ordinals)?;
+            access_plan_for_ordinals(&rg_rows, &ordinals)
+                .map(|plan| (idx, object_meta.location.to_string(), row_groups, plan))
         }
     });
-    let plans: Vec<Option<(usize, ParquetAccessPlan)>> = futures::stream::iter(fetches)
-        .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
-        .collect()
-        .await;
-    for (idx, plan) in plans.into_iter().flatten() {
+    let plans: Vec<Option<(usize, String, Vec<usize>, ParquetAccessPlan)>> =
+        futures::stream::iter(fetches)
+            .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+    let mut selected = Vec::new();
+    for (idx, file, row_groups, plan) in plans.into_iter().flatten() {
+        crate::delta_datafusion::parquet_metrics::record_selected_row_groups(row_groups.len());
+        selected.push(format!("{file}:{row_groups:?}"));
         files[idx].0.extensions.insert(plan);
     }
+    let span = tracing::Span::current();
+    span.record("parquet.selected_row_groups", &selected.join(","));
+}
+
+fn row_groups_for_ordinals(rg_row_counts: &[i64], ordinals: &[u64]) -> Option<Vec<usize>> {
+    let total_rows: u64 = rg_row_counts.iter().map(|&n| n.max(0) as u64).sum();
+    let mut ordinals = ordinals.to_vec();
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    if ordinals
+        .last()
+        .is_some_and(|&ordinal| ordinal >= total_rows)
+    {
+        return None;
+    }
+    let (mut offset, mut idx, mut selected) = (0u64, 0usize, Vec::new());
+    for (row_group, &rows) in rg_row_counts.iter().enumerate() {
+        let end = offset + rows.max(0) as u64;
+        let start = idx;
+        while idx < ordinals.len() && ordinals[idx] < end {
+            idx += 1;
+        }
+        if idx > start {
+            selected.push(row_group);
+        }
+        offset = end;
+    }
+    Some(selected)
 }
 
 /// Match a store-rooted object path against a table-relative parquet path, requiring the match
@@ -917,7 +972,10 @@ fn access_plan_for_ordinals(rg_row_counts: &[i64], ordinals: &[u64]) -> Option<P
     let mut ordinals = ordinals.to_vec();
     ordinals.sort_unstable();
     ordinals.dedup();
-    if ordinals.last().is_some_and(|&ordinal| ordinal >= total_rows) {
+    if ordinals
+        .last()
+        .is_some_and(|&ordinal| ordinal >= total_rows)
+    {
         return None;
     }
 
@@ -1104,7 +1162,9 @@ mod tests {
                     .into()
                 ),
                 // RG1: rows {2, 3} → skip 2, select 2 (coalesced, no trailing skip)
-                RowGroupAccess::Selection(vec![RowSelector::skip(2), RowSelector::select(2)].into()),
+                RowGroupAccess::Selection(
+                    vec![RowSelector::skip(2), RowSelector::select(2)].into()
+                ),
             ]
         );
 
