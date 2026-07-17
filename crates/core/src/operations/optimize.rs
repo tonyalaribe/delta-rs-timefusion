@@ -20,7 +20,7 @@
 //! let (table, metrics) = OptimizeBuilder::new(table.object_store(), table.state).await?;
 //! ````
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -314,6 +314,9 @@ pub struct OptimizeBuilder<'a> {
     log_store: LogStoreRef,
     /// Filters to select specific table partitions to be optimized
     filters: &'a [PartitionFilter],
+    /// Exact parquet paths to rewrite. Takes precedence over bin-packing for
+    /// sorted dedup rewrites.
+    selected_files: Option<&'a [String]>,
     /// Desired file size after bin-packing files
     target_size: Option<NonZeroU64>,
     /// Properties passed to underlying parquet writer
@@ -347,6 +350,7 @@ impl<'a> OptimizeBuilder<'a> {
             snapshot,
             log_store,
             filters: &[],
+            selected_files: None,
             target_size: None,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
@@ -368,6 +372,15 @@ impl<'a> OptimizeBuilder<'a> {
     /// Only optimize files that return true for the specified partition filter
     pub fn with_filters(mut self, filters: &'a [PartitionFilter]) -> Self {
         self.filters = filters;
+        self
+    }
+
+    /// Rewrite exactly these live parquet paths instead of planner-selected bins.
+    ///
+    /// This is intended for targeted maintenance such as a sealed dedup range:
+    /// every supplied file is retained, even if it exceeds the target size.
+    pub fn with_files(mut self, files: &'a [String]) -> Self {
+        self.selected_files = Some(files);
         self
     }
 
@@ -478,6 +491,7 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                 this.optimize_type,
                 &snapshot,
                 this.filters,
+                this.selected_files.as_deref(),
                 this.target_size.to_owned(),
                 writer_properties,
                 session,
@@ -1265,6 +1279,7 @@ pub async fn create_merge_plan(
     optimize_type: OptimizeType,
     snapshot: &EagerSnapshot,
     filters: &[PartitionFilter],
+    selected_files: Option<&[String]>,
     target_size: Option<NonZeroU64>,
     writer_properties: WriterProperties,
     session: SessionState,
@@ -1298,6 +1313,7 @@ pub async fn create_merge_plan(
                 snapshot,
                 partitions_keys,
                 filters,
+                selected_files,
                 target_size,
             )
             .await?
@@ -1311,6 +1327,7 @@ pub async fn create_merge_plan(
                 snapshot,
                 partitions_keys,
                 filters,
+                selected_files,
                 target_size,
             )
             .await?
@@ -1699,6 +1716,7 @@ async fn build_sort_plan(
     snapshot: &EagerSnapshot,
     partition_keys: &[String],
     filters: &[PartitionFilter],
+    selected_files: Option<&[String]>,
     target_size: NonZeroU64,
 ) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
     if sort_columns.is_empty() {
@@ -1747,16 +1765,21 @@ async fn build_sort_plan(
         )?))
     };
 
-    // Same file selection as `build_compaction_plan`: newest-first, skip files
-    // already at/above target_size so an already-sorted partition re-runs to a
-    // near no-op. The only difference is each bin is sorted (not just
-    // concatenated) on write — see the SortBy arm in `execute`.
+    let selected: Option<HashSet<&str>> =
+        selected_files.map(|files| files.iter().map(String::as_str).collect());
     let mut file_stream = snapshot.file_views(log_store, predicate);
     while let Some(file) = file_stream.next().await {
         let file = file?;
+        let add = file.to_add();
+        if selected.as_ref().is_some_and(|files| {
+            !files
+                .iter()
+                .any(|file| *file == add.path.as_str() || file.ends_with(add.path.as_str()))
+        }) {
+            continue;
+        }
         metrics.total_considered_files += 1;
         let object_meta = ObjectMeta::try_from(&file)?;
-        let add = file.to_add();
         let partition_values = full_partition_values(snapshot, &add)?;
         let entry = partition_files
             .entry(partition_values.hive_partition_path())
@@ -1764,11 +1787,10 @@ async fn build_sort_plan(
         let stable_ordinal = entry.1;
         entry.1 += 1;
 
-        if object_meta.size > target_size.get() {
+        if selected.is_none() && object_meta.size > target_size.get() {
             metrics.total_files_skipped += 1;
             continue;
         }
-
         entry.2.push(OrderedFileCandidate {
             add,
             stable_ordinal,
@@ -1778,23 +1800,32 @@ async fn build_sort_plan(
 
     let mut operations: HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)> = HashMap::new();
     for (part, (partition, _, files)) in partition_files {
-        let (merge_bins, partition_stats) =
-            plan_compaction_bins_in_stable_order(files, target_size.get());
+        let (merge_bins, partition_stats) = if selected.is_some() {
+            let mut bin = MergeBin::new();
+            for file in files {
+                bin.add(file.add);
+            }
+            (vec![bin], PlannerStats::preserve_locality())
+        } else {
+            plan_compaction_bins_in_stable_order(files, target_size.get())
+        };
         planner_stats.absorb(&partition_stats);
         operations.insert(part, (partition, merge_bins));
     }
 
-    // Drop single-file bins: a lone file is already sorted (prior run) and
-    // rewriting it changes nothing but its name.
-    for (_, (_, bins)) in operations.iter_mut() {
-        bins.retain(|bin| {
-            if bin.len() == 1 {
-                metrics.total_files_skipped += 1;
-                false
-            } else {
-                true
-            }
-        });
+    if selected.is_none() {
+        // A lone normal SortBy file is already sorted; exact-file rewrites must
+        // retain it because the caller explicitly selected it for dedup.
+        for (_, (_, bins)) in operations.iter_mut() {
+            bins.retain(|bin| {
+                if bin.len() == 1 {
+                    metrics.total_files_skipped += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
     operations.retain(|_, (_, bins)| !bins.is_empty());
     metrics.partitions_optimized = operations.len() as u64;

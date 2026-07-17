@@ -653,6 +653,68 @@ async fn test_optimize_sortby_dedup_keeps_greatest_tiebreak_across_files()
 }
 
 #[tokio::test]
+async fn test_optimize_sortby_dedup_rewrites_exact_selected_files() -> Result<(), Box<dyn Error>> {
+    let context = setup_test(false).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+    let mut known = std::collections::HashSet::new();
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 10)], "2022-05-22")?,
+    )
+    .await?;
+    let first: Vec<String> = dt
+        .get_file_uris()?
+        .filter(|file| !known.contains(file))
+        .collect();
+    known.extend(first.iter().cloned());
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 30)], "2022-05-22")?,
+    )
+    .await?;
+    let second: Vec<String> = dt
+        .get_file_uris()?
+        .filter(|file| !known.contains(file))
+        .collect();
+    known.extend(second.iter().cloned());
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(2, 20)], "2022-05-22")?,
+    )
+    .await?;
+    assert_eq!(known.len(), 2);
+    let files: Vec<String> = first.into_iter().chain(second).collect();
+
+    let sort = vec![SortColumn {
+        column: "x".into(),
+        descending: false,
+        nulls_first: false,
+    }];
+    let dedup = deltalake_core::operations::optimize::DedupConfig {
+        columns: vec!["x".into()],
+        tiebreak: Some(SortColumn {
+            column: "y".into(),
+            descending: true,
+            nulls_first: false,
+        }),
+    };
+    let (dt, metrics) = dt
+        .optimize()
+        .with_type(OptimizeType::SortByDedup(sort, dedup))
+        .with_files(&files[..2])
+        .with_target_size(NonZeroU64::new(1).unwrap())
+        .await?;
+
+    assert_eq!(metrics.num_files_removed, 2);
+    assert_eq!(sorted_xy_values(&dt).await?, vec![(1, 30), (2, 20)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_write_default_writer_properties_include_delta_rs_created_by()
 -> Result<(), Box<dyn Error>> {
     let context = setup_test(false).await?;
@@ -833,6 +895,7 @@ async fn test_optimize_selected_file_scans_register_operation_scoped_log_store()
         OptimizeType::Compact,
         tracked_table.snapshot()?.snapshot(),
         &[],
+        None,
         Some(NonZeroU64::new(1_000_000).unwrap()),
         WriterProperties::builder().build(),
         df_context.state(),
@@ -986,6 +1049,7 @@ async fn test_conflict_for_remove_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &filter,
         None,
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -1053,6 +1117,7 @@ async fn test_no_conflict_for_append_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &filter,
         None,
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -1116,6 +1181,7 @@ async fn test_commit_interval() -> Result<(), Box<dyn Error>> {
         OptimizeType::Compact,
         dt.snapshot()?.snapshot(),
         &[],
+        None,
         None,
         WriterProperties::builder().build(),
         context.state(),
