@@ -431,10 +431,20 @@ impl DeltaScanConfig {
         // it reaches the scan's physical_arrow_schema pass.
         if let DataType::Struct(fs) = field.data_type() {
             let is_variant = fs.len() == 2
-                && fs.iter().any(|f| f.name() == "metadata"
-                    && matches!(f.data_type(), DataType::Binary | DataType::BinaryView | DataType::LargeBinary))
-                && fs.iter().any(|f| f.name() == "value"
-                    && matches!(f.data_type(), DataType::Binary | DataType::BinaryView | DataType::LargeBinary));
+                && fs.iter().any(|f| {
+                    f.name() == "metadata"
+                        && matches!(
+                            f.data_type(),
+                            DataType::Binary | DataType::BinaryView | DataType::LargeBinary
+                        )
+                })
+                && fs.iter().any(|f| {
+                    f.name() == "value"
+                        && matches!(
+                            f.data_type(),
+                            DataType::Binary | DataType::BinaryView | DataType::LargeBinary
+                        )
+                });
             if is_variant {
                 return field;
             }

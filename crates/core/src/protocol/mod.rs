@@ -566,8 +566,14 @@ mod tests {
 
         // Mirror how operations::optimize stores its filter: serde_json of the
         // PartitionFilters, whose Serialize emits SQL strings.
-        let one = vec![PartitionFilter { key: "date".into(), value: PartitionValue::Equal("2026-06-02".into()) }];
-        let op = DeltaOperation::Optimize { predicate: serde_json::to_string(&one).ok(), target_size: 0 };
+        let one = vec![PartitionFilter {
+            key: "date".into(),
+            value: PartitionValue::Equal("2026-06-02".into()),
+        }];
+        let op = DeltaOperation::Optimize {
+            predicate: serde_json::to_string(&one).ok(),
+            target_size: 0,
+        };
         // Regression: previously returned None, so the conflict checker treated
         // compaction as a whole-table read and falsely raised ConcurrentDeleteRead
         // against dedups in unrelated partitions.
@@ -575,15 +581,41 @@ mod tests {
 
         // Multiple filters conjoin with AND.
         let many = vec![
-            PartitionFilter { key: "date".into(), value: PartitionValue::Equal("2026-06-02".into()) },
-            PartitionFilter { key: "project_id".into(), value: PartitionValue::Equal("abc".into()) },
+            PartitionFilter {
+                key: "date".into(),
+                value: PartitionValue::Equal("2026-06-02".into()),
+            },
+            PartitionFilter {
+                key: "project_id".into(),
+                value: PartitionValue::Equal("abc".into()),
+            },
         ];
-        let op_many = DeltaOperation::Optimize { predicate: serde_json::to_string(&many).ok(), target_size: 0 };
-        assert_eq!(op_many.read_predicate().as_deref(), Some("date = '2026-06-02' AND project_id = 'abc'"));
+        let op_many = DeltaOperation::Optimize {
+            predicate: serde_json::to_string(&many).ok(),
+            target_size: 0,
+        };
+        assert_eq!(
+            op_many.read_predicate().as_deref(),
+            Some("date = '2026-06-02' AND project_id = 'abc'")
+        );
 
         // No/empty filter ⇒ no predicate (genuine whole-table optimize).
-        assert_eq!(DeltaOperation::Optimize { predicate: None, target_size: 0 }.read_predicate(), None);
-        assert_eq!(DeltaOperation::Optimize { predicate: Some("[]".into()), target_size: 0 }.read_predicate(), None);
+        assert_eq!(
+            DeltaOperation::Optimize {
+                predicate: None,
+                target_size: 0
+            }
+            .read_predicate(),
+            None
+        );
+        assert_eq!(
+            DeltaOperation::Optimize {
+                predicate: Some("[]".into()),
+                target_size: 0
+            }
+            .read_predicate(),
+            None
+        );
     }
 
     #[test]

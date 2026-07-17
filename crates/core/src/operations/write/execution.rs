@@ -719,7 +719,10 @@ fn variant_normalize_schema(schema: &Arc<Schema>) -> Arc<Schema> {
             }
         })
         .collect();
-    Arc::new(Schema::new_with_metadata(normalized, schema.metadata().clone()))
+    Arc::new(Schema::new_with_metadata(
+        normalized,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Wrap each stream with a Variant-normalizing cast. No-op if `target_schema`
@@ -738,8 +741,13 @@ fn variant_normalize_streams(
             let sch = target_schema.clone();
             let mapped = s.map(move |r| {
                 r.and_then(|batch| {
-                    crate::kernel::schema::cast::cast_record_batch(&batch, sch.clone(), false, false)
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+                    crate::kernel::schema::cast::cast_record_batch(
+                        &batch,
+                        sch.clone(),
+                        false,
+                        false,
+                    )
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 })
             });
             Box::pin(RecordBatchStreamAdapter::new(target_schema.clone(), mapped))

@@ -22,7 +22,9 @@ use datafusion::common::{
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::collect_columns;
-use datafusion::physical_expr::{Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr,
+};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -847,7 +849,10 @@ mod tests {
         use arrow::compute::SortOptions;
         // Ordering as it comes off the inner parquet scan: [timestamp@0, id@1, level@2].
         let src = LexOrdering::new(vec![
-            PhysicalSortExpr::new(Arc::new(Column::new("timestamp", 0)), SortOptions::default()),
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("timestamp", 0)),
+                SortOptions::default(),
+            ),
             PhysicalSortExpr::new(Arc::new(Column::new("id", 1)), SortOptions::default()),
             PhysicalSortExpr::new(Arc::new(Column::new("level", 2)), SortOptions::default()),
         ])

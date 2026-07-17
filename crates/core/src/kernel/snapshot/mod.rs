@@ -1197,7 +1197,10 @@ fn drop_removed_paths(
         };
         // `get_string_value` reads only Utf8/LargeUtf8/Utf8View; bail to a full
         // update on any other path column type rather than dropping nothing.
-        if !matches!(col.data_type(), ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View) {
+        if !matches!(
+            col.data_type(),
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+        ) {
             return Ok(None);
         }
         let keep: BooleanArray = (0..batch.num_rows())
@@ -1205,7 +1208,11 @@ fn drop_removed_paths(
             .collect();
         // Most carried batches are untouched by a partition-scoped replace_where
         // — skip the (copying) filter when nothing was removed from this one.
-        out.push(if keep.false_count() == 0 { batch } else { filter_record_batch(&batch, &keep)? });
+        out.push(if keep.false_count() == 0 {
+            batch
+        } else {
+            filter_record_batch(&batch, &keep)?
+        });
     }
     Ok(Some(out))
 }
