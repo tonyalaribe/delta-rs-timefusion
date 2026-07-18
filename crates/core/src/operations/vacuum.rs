@@ -305,18 +305,28 @@ impl VacuumBuilder {
                 TombstonePathSets::default(),
             )
         };
-        let valid_files: HashSet<_> = snapshot
-            .snapshot()
-            .active_adds(
-                self.log_store.as_ref(),
-                ActiveAddOptions {
-                    predicate: None,
-                    stats: AddStatsPolicy::None,
-                },
-            )
-            .map_ok(|f| f.object_store_path())
-            .try_collect()
-            .await?;
+        // Valid = every live Add's data file, PLUS the deletion-vector `.bin` file it
+        // references. Without the DV paths, Full-mode vacuum lists the object store and
+        // deletes any file not in this set — which would delete a DV still referenced by a
+        // live Add and resurrect its logically-deleted rows.
+        let mut valid_files: HashSet<Path> = HashSet::new();
+        let mut adds = snapshot.snapshot().active_adds(
+            self.log_store.as_ref(),
+            ActiveAddOptions {
+                predicate: None,
+                stats: AddStatsPolicy::None,
+            },
+        );
+        while let Some(f) = adds.try_next().await? {
+            valid_files.insert(f.object_store_path());
+            if let Some(desc) = f.deletion_vector_descriptor()
+                && let Some(rel) =
+                    crate::operations::deletion_vectors::dv_object_store_relative_path(&desc)
+            {
+                valid_files.insert(Path::from(rel));
+            }
+        }
+        drop(adds);
 
         let partition_columns = snapshot.metadata().partition_columns();
 
