@@ -103,6 +103,9 @@ pub struct UpdateBuilder {
     /// By default an error is returned
     safe_cast: bool,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    /// Use merge-on-read deletion vectors: append only the updated rows and mask the
+    /// originals with a DV, instead of rewriting every matched file in full.
+    deletion_vectors: bool,
 }
 
 #[derive(Default, Serialize, Debug)]
@@ -145,12 +148,21 @@ impl UpdateBuilder {
             commit_properties: CommitProperties::default(),
             safe_cast: false,
             custom_execute_handler: None,
+            deletion_vectors: false,
         }
     }
 
     /// Which records to update
     pub fn with_predicate<E: Into<Expression>>(mut self, predicate: E) -> Self {
         self.predicate = Some(predicate.into());
+        self
+    }
+
+    /// Perform the update as a merge-on-read operation: append the rewritten matched
+    /// rows as new files and mask the originals with a deletion vector, instead of
+    /// rewriting each matched file in full. Requires the `deletionVectors` writer feature.
+    pub fn with_deletion_vectors(mut self, enabled: bool) -> Self {
+        self.deletion_vectors = enabled;
         self
     }
 
@@ -263,6 +275,37 @@ impl ExtensionPlanner for UpdateMetricExtensionPlanner {
     }
 }
 
+/// Projection for the deletion-vector UPDATE append: apply each SET assignment to its
+/// column (casting to the target type) and pass every other column through unchanged.
+/// Rows are already filtered to the predicate, so no per-row conditional is needed.
+fn updated_row_expressions(
+    updates: &HashMap<String, Expr>,
+    schema: &datafusion::common::DFSchema,
+    safe_cast: bool,
+) -> DeltaResult<Vec<Expr>> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let expr = match updates.get(field.name()) {
+                Some(expr) => {
+                    let target_type = field.data_type().clone();
+                    let update_expr = if expr.get_type(schema)? == target_type {
+                        expr.to_owned()
+                    } else if safe_cast {
+                        try_cast(expr.to_owned(), target_type)
+                    } else {
+                        cast(expr.to_owned(), target_type)
+                    };
+                    update_expr.alias(field.name())
+                }
+                None => col(Column::from_name(field.name())),
+            };
+            Ok::<_, DeltaTableError>(expr)
+        })
+        .try_collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
@@ -281,6 +324,7 @@ async fn execute(
     writer_properties: Option<WriterProperties>,
     operation_id: Uuid,
     safe_cast: bool,
+    deletion_vectors: bool,
 ) -> DeltaResult<(Vec<Action>, UpdateMetrics)> {
     // Validate the predicate and update expressions.
     //
@@ -317,6 +361,45 @@ async fn execute(
         // no files contain data matching the predicate, so nothing more todo.
         return Ok((vec![], metrics));
     };
+
+    if deletion_vectors {
+        // Merge-on-read: append only the rewritten matched rows, then mask the originals
+        // with a DV. Unmatched rows stay untouched in the original files.
+        let updated_only = LogicalPlanBuilder::new(files_scan.scan().clone())
+            .filter(files_scan.predicate.clone())?
+            .project(updated_row_expressions(&updates, files_scan.scan().schema(), safe_cast)?)?
+            .build()?;
+        let physical_plan = session.create_physical_plan(&updated_only).await?;
+        let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
+        let mut actions = write_execution_plan(
+            Some(snapshot),
+            session,
+            physical_plan,
+            table_partition_cols.to_vec(),
+            log_store.object_store(Some(operation_id)).clone(),
+            Some(snapshot.table_properties().target_file_size()),
+            None,
+            writer_properties.clone(),
+            writer_stats_config,
+        )
+        .await?;
+        let appended = actions.len();
+
+        let (dv_actions, num_matched) = crate::operations::delete::deletion_vector_delete(
+            session,
+            snapshot,
+            log_store.clone(),
+            &files_scan,
+        )
+        .await?;
+        // Each masked file contributes one Remove + one Add.
+        metrics.num_removed_files = dv_actions.len() / 2;
+        metrics.num_added_files = appended + dv_actions.len() / 2;
+        metrics.num_updated_rows = num_matched;
+        actions.extend(dv_actions);
+        metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
+        return Ok((actions, metrics));
+    }
 
     // Take advantage of how null counts are tracked in arrow arrays use the
     // null count to track how many records do NOT satisfy the predicate.  The
@@ -515,6 +598,7 @@ impl std::future::IntoFuture for UpdateBuilder {
                 this.writer_properties,
                 operation_id,
                 this.safe_cast,
+                this.deletion_vectors,
             )
             .await?;
 

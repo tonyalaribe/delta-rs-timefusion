@@ -72,6 +72,57 @@ async fn test_update_when_delta_table_is_append_only() {
 
 // <https://github.com/delta-io/delta-rs/issues/3414>
 #[tokio::test]
+async fn test_update_with_deletion_vectors() -> DeltaResult<()> {
+    let schema = get_arrow_schema(&None);
+    let table =
+        setup_table_with_configuration(TableProperty::EnableDeletionVectors, Some("true")).await;
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "B", "A", "A"])),
+            Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+            Arc::new(StringArray::from(vec![
+                "2021-02-02",
+                "2021-02-02",
+                "2021-02-02",
+                "2021-02-02",
+            ])),
+        ],
+    )?;
+    let table = write_batch(table, batch).await;
+    assert_eq!(table.snapshot()?.log_data().num_files(), 1);
+
+    let (table, metrics) = table
+        .update()
+        .with_update("modified", lit("2023-05-14"))
+        .with_predicate(col("value").eq(lit(10)))
+        .with_deletion_vectors(true)
+        .await?;
+
+    // Two matched rows appended as a new file; the original file is masked, not rewritten.
+    assert_eq!(metrics.num_updated_rows, 2);
+    assert_eq!(metrics.num_removed_files, 1);
+    // one appended file + one re-added (masked) file
+    assert_eq!(metrics.num_added_files, 2);
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+
+    let expected = vec![
+        "+----+-------+------------+",
+        "| id | value | modified   |",
+        "+----+-------+------------+",
+        "| A  | 1     | 2021-02-02 |",
+        "| A  | 10    | 2023-05-14 |",
+        "| A  | 100   | 2021-02-02 |",
+        "| B  | 10    | 2023-05-14 |",
+        "+----+-------+------------+",
+    ];
+    let actual = get_data(&table).await;
+    assert_batches_sorted_eq!(&expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_update_predicate_left_in_data() -> DeltaResult<()> {
     let schema = get_arrow_schema(&None);
     let table = setup_table(None).await;

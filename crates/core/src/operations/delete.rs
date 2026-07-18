@@ -685,7 +685,7 @@ const DV_ROW_INDEX_COL: &str = "__delta_rs_dv_row_index";
 /// Merge-on-read delete: for each matched file, collect the physical row indexes whose
 /// rows satisfy the predicate, then write/merge a deletion vector instead of rewriting the
 /// file. Returns the `Remove`+`Add` actions and the total number of newly-deleted rows.
-async fn deletion_vector_delete(
+pub(crate) async fn deletion_vector_delete(
     session: &dyn Session,
     snapshot: &EagerSnapshot,
     log_store: LogStoreRef,
