@@ -93,7 +93,7 @@ mod data_validation;
 pub mod engine;
 pub mod expr;
 mod file_id;
-mod find_files;
+pub(crate) mod find_files;
 pub mod logical;
 pub mod parquet_metrics;
 pub mod physical;

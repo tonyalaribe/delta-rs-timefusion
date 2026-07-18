@@ -108,6 +108,8 @@ pub struct DeleteBuilder {
     /// Commit properties and configuration
     commit_properties: CommitProperties,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    /// Use merge-on-read deletion vectors instead of rewriting matched files.
+    deletion_vectors: bool,
 }
 
 impl std::fmt::Debug for DeleteBuilder {
@@ -235,7 +237,18 @@ impl DeleteBuilder {
             commit_properties: CommitProperties::default(),
             writer_properties: None,
             custom_execute_handler: None,
+            deletion_vectors: false,
         }
+    }
+
+    /// Delete matched rows by writing merge-on-read deletion vectors instead of
+    /// rewriting the matched data files. Requires the `deletionVectors` writer feature.
+    ///
+    /// Only the row-level predicate path uses DVs; partition-only and full-table
+    /// deletes still drop whole files (no DV needed).
+    pub fn with_deletion_vectors(mut self, enabled: bool) -> Self {
+        self.deletion_vectors = enabled;
+        self
     }
 
     /// A predicate that determines if a record is deleted
@@ -335,6 +348,7 @@ impl std::future::IntoFuture for DeleteBuilder {
                 snapshot.clone(),
                 &session,
                 operation_id,
+                this.deletion_vectors,
             )
             .await?;
 
@@ -426,6 +440,7 @@ async fn execute(
     snapshot: EagerSnapshot,
     session: &dyn Session,
     operation_id: Uuid,
+    deletion_vectors: bool,
 ) -> DeltaResult<(Vec<Action>, DeleteMetrics)> {
     let exec_start = Instant::now();
     let mut metrics = DeleteMetrics {
@@ -545,6 +560,17 @@ async fn execute(
         return Ok((vec![], metrics));
     };
 
+    if deletion_vectors {
+        let (actions, num_deleted) =
+            deletion_vector_delete(session, &snapshot, log_store.clone(), &files_scan).await?;
+        // Each changed file contributes one Remove + one Add (same path, new DV).
+        metrics.num_removed_files = actions.len() / 2;
+        metrics.num_added_files = actions.len() / 2;
+        metrics.num_deleted_rows = Some(num_deleted);
+        metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
+        return Ok((actions, metrics));
+    }
+
     let root_url = Arc::new(snapshot.table_configuration().table_root().clone());
     let removes: Vec<_> = snapshot
         .snapshot()
@@ -650,6 +676,93 @@ async fn execute(
 
     metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
     Ok((actions, metrics))
+}
+
+/// Column name used to surface each row's physical (file-relative) index during a
+/// deletion-vector delete. Chosen to avoid clashing with user columns.
+const DV_ROW_INDEX_COL: &str = "__delta_rs_dv_row_index";
+
+/// Merge-on-read delete: for each matched file, collect the physical row indexes whose
+/// rows satisfy the predicate, then write/merge a deletion vector instead of rewriting the
+/// file. Returns the `Remove`+`Add` actions and the total number of newly-deleted rows.
+async fn deletion_vector_delete(
+    session: &dyn Session,
+    snapshot: &EagerSnapshot,
+    log_store: LogStoreRef,
+    files_scan: &crate::delta_datafusion::find_files::MatchedFilesScan,
+) -> DeltaResult<(Vec<Action>, usize)> {
+    use arrow_array::UInt64Array;
+    use datafusion::datasource::provider_as_source;
+    use datafusion::logical_expr::{LogicalPlanBuilder, col};
+    use datafusion::physical_plan::collect;
+
+    use crate::kernel::Add;
+    use crate::operations::deletion_vectors::{write_deletion_vectors, FileDeletion};
+
+    let table = DeltaTable::new_with_state(log_store.clone(), DeltaTableState {
+        snapshot: snapshot.clone(),
+    });
+
+    // Matched files, restricted to the authoritative valid set from the scan.
+    let valid = Arc::new(files_scan.files_set());
+    let root = Arc::new(snapshot.table_configuration().table_root().clone());
+    let matched_adds: Vec<Add> = snapshot
+        .snapshot()
+        .active_adds(log_store.as_ref(), ActiveAddOptions {
+            predicate: Some(files_scan.delta_predicate.clone()),
+            stats: AddStatsPolicy::RawJson,
+        })
+        .try_filter_map(|f| {
+            let (valid, root) = (Arc::clone(&valid), Arc::clone(&root));
+            async move {
+                let url = root
+                    .join(f.path_raw())
+                    .map_err(|e| exec_datafusion_err!("{e}"))?;
+                Ok(valid.contains(url.as_ref()).then(|| f.to_add()))
+            }
+        })
+        .try_collect()
+        .await?;
+
+    let mut deletions = Vec::with_capacity(matched_adds.len());
+    for add in matched_adds {
+        // Scan just this file, exposing physical row indexes, and keep the indexes whose
+        // rows satisfy the predicate.
+        let provider = table
+            .table_provider()
+            .with_row_index_column(DV_ROW_INDEX_COL)
+            .with_adds([add.clone()])
+            .build()
+            .await?;
+        let plan = LogicalPlanBuilder::scan(
+            "dv_scan",
+            provider_as_source(Arc::new(provider)),
+            None,
+        )?
+        .filter(files_scan.predicate.clone())?
+        .project([col(DV_ROW_INDEX_COL)])?
+        .build()?;
+        let exec = session.create_physical_plan(&plan).await?;
+        let batches = collect(exec, session.task_ctx()).await?;
+
+        let mut deleted_indexes = Vec::new();
+        for batch in &batches {
+            let idx = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DeltaTableError::Generic("row index column is not UInt64".into())
+                })?;
+            // The scan exposes a 1-based row number; DV physical indexes are 0-based.
+            deleted_indexes.extend(idx.iter().flatten().map(|v| v - 1));
+        }
+        deletions.push(FileDeletion { add, deleted_indexes });
+    }
+
+    let num_deleted: usize = deletions.iter().map(|d| d.deleted_indexes.len()).sum();
+    let actions = write_deletion_vectors(log_store.as_ref(), &root, deletions).await?;
+    Ok((actions, num_deleted))
 }
 
 async fn find_file_paths_by_partition_predicate_datafusion(
@@ -861,6 +974,67 @@ mod tests {
         let actual = get_data(&table).await;
         assert!(actual.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_deletion_vectors() {
+        use crate::writer::test_utils::datafusion::get_data_sorted;
+
+        let schema = get_arrow_schema(&None);
+        let table =
+            setup_table_with_configuration(TableProperty::EnableDeletionVectors, Some("true")).await;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["A", "B", "A", "A"])),
+                Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "2021-02-02",
+                    "2021-02-02",
+                    "2021-02-02",
+                    "2021-02-02",
+                ])),
+            ],
+        )
+        .unwrap();
+        let table = table
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
+
+        let (table, metrics) = table
+            .delete()
+            .with_predicate(col("value").eq(lit(10)))
+            .with_deletion_vectors(true)
+            .await
+            .unwrap();
+
+        // Merge-on-read: the file is not rewritten, it is re-added with a DV.
+        assert_eq!(metrics.num_removed_files, 1);
+        assert_eq!(metrics.num_added_files, 1);
+        assert_eq!(metrics.num_deleted_rows, Some(2));
+        let state = table.snapshot().unwrap();
+        assert_eq!(state.log_data().num_files(), 1);
+
+        let data = get_data_sorted(&table, "value").await;
+        let batches = data;
+        let vals: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("value")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 100]);
     }
 
     #[tokio::test]
