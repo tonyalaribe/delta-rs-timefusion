@@ -73,6 +73,9 @@ async fn collect_active_paths(
     snapshot: &Snapshot,
     log_store: &dyn LogStore,
 ) -> DeltaResult<HashSet<Path>> {
+    // Every live Add's data file PLUS the deletion-vector file it references: Full-mode
+    // vacuum deletes anything outside this set, and dropping a live DV resurrects its
+    // logically-deleted rows.
     snapshot
         .active_adds(
             log_store,
@@ -81,8 +84,17 @@ async fn collect_active_paths(
                 stats: AddStatsPolicy::None,
             },
         )
-        .map_ok(|file| file.object_store_path())
-        .try_collect()
+        .try_fold(HashSet::new(), |mut paths, file| async move {
+            paths.insert(file.object_store_path());
+            if let Some(rel) = file
+                .deletion_vector_descriptor()
+                .as_ref()
+                .and_then(crate::operations::deletion_vectors::dv_object_store_relative_path)
+            {
+                paths.insert(Path::from(rel));
+            }
+            Ok(paths)
+        })
         .await
 }
 

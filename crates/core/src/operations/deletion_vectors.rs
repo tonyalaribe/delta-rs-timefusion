@@ -37,6 +37,19 @@ pub(crate) struct FileDeletion {
 const DV_SIZE_PREFIX: usize = 4; // big-endian u32: size of (magic + data)
 const DV_MAGIC_LEN: usize = 4; // little-endian magic
 
+/// Table-root-relative object-store path of the `.bin` file backing a persisted DV, if any.
+///
+/// Returns `None` for inline DVs (no file) and for descriptors that don't decode. Used by
+/// VACUUM to treat DV files referenced by live Adds as valid (never garbage-collect them).
+pub(crate) fn dv_object_store_relative_path(desc: &DeletionVectorDescriptor) -> Option<String> {
+    match desc.storage_type {
+        StorageType::UuidRelativePath => dv_relative_path(desc).ok(),
+        // Absolute path: the descriptor already holds the object path/URL.
+        StorageType::AbsolutePath => Some(desc.path_or_inline_dv.clone()),
+        StorageType::Inline => None,
+    }
+}
+
 /// Reconstruct the DV file's relative path from a persisted-relative descriptor.
 ///
 /// `path_or_inline_dv` is `<prefix><z85(uuid)>`; the uuid is the trailing 20 chars.
@@ -263,6 +276,47 @@ mod tests {
     async fn dv_write_hides_exactly_the_deleted_rows() -> DeltaResult<()> {
         let table = make_table().await;
         let table = commit_dv(table, vec![1, 3, 5]).await?;
+        let data = get_data_sorted(&table, "value").await;
+        assert_eq!(sorted_values(&data), vec![0, 2, 4, 6, 7, 8, 9]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_vacuum_keeps_live_dv_files_and_preserves_deletes() -> DeltaResult<()> {
+        use crate::operations::vacuum::{VacuumBuilder, VacuumMode};
+        use object_store::ObjectStore as _;
+
+        let table = make_table().await;
+        let table = commit_dv(table, vec![1, 3, 5]).await?;
+
+        // Locate the DV file written by the delete.
+        let store = table.log_store().object_store(None);
+        let list: Vec<_> = store.list(None).try_collect::<Vec<_>>().await.unwrap();
+        let dv_files: Vec<_> = list
+            .iter()
+            .filter(|m| m.location.as_ref().contains("deletion_vector_"))
+            .map(|m| m.location.clone())
+            .collect();
+        assert_eq!(dv_files.len(), 1, "expected one DV file, got {dv_files:?}");
+
+        // Full vacuum with zero retention — the aggressive case that lists the store.
+        let (table, result) =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot().clone()))
+                .with_retention_period(chrono::Duration::hours(0))
+                .with_mode(VacuumMode::Full)
+                .with_enforce_retention_duration(false)
+                .await?;
+        assert!(
+            !result.files_deleted.iter().any(|f| f.contains("deletion_vector_")),
+            "vacuum deleted a live DV file: {:?}",
+            result.files_deleted
+        );
+
+        // The DV file survives and the logically-deleted rows stay hidden.
+        assert!(
+            store.head(&dv_files[0]).await.is_ok(),
+            "live DV file was garbage-collected by full vacuum"
+        );
         let data = get_data_sorted(&table, "value").await;
         assert_eq!(sorted_values(&data), vec![0, 2, 4, 6, 7, 8, 9]);
         Ok(())
