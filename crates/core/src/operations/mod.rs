@@ -68,6 +68,8 @@ pub mod load_cdf;
 #[cfg(feature = "datafusion")]
 pub mod merge;
 #[cfg(feature = "datafusion")]
+pub mod merge_dv;
+#[cfg(feature = "datafusion")]
 pub mod optimize;
 pub mod set_tbl_properties;
 #[cfg(feature = "datafusion")]

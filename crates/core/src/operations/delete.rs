@@ -680,7 +680,7 @@ async fn execute(
 
 /// Column name used to surface each row's physical (file-relative) index during a
 /// deletion-vector delete. Chosen to avoid clashing with user columns.
-const DV_ROW_INDEX_COL: &str = "__delta_rs_dv_row_index";
+pub(crate) const DV_ROW_INDEX_COL: &str = "__delta_rs_dv_row_index";
 
 /// Merge-on-read delete: for each matched file, collect the physical row indexes whose
 /// rows satisfy the predicate, then write/merge a deletion vector instead of rewriting the
