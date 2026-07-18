@@ -198,7 +198,9 @@ async fn candidate_adds(
     use futures::TryStreamExt;
 
     let predicate = match target_predicate {
-        Some(p) => p,
+        // Strip relation qualifiers (e.g. `otel_logs_and_spans.col` or `target.col`) so the
+        // predicate resolves against the internal file-skipping scan, which exposes bare columns.
+        Some(p) => unqualify_columns(p)?,
         None => {
             return snapshot
                 .file_views(log_store.as_ref(), None)
@@ -229,6 +231,21 @@ async fn candidate_adds(
         })
         .try_collect()
         .await
+}
+
+/// Drop relation qualifiers from every column reference in `expr`.
+fn unqualify_columns(expr: Expr) -> DeltaResult<Expr> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    Ok(expr
+        .transform(|e| {
+            Ok(match e {
+                Expr::Column(c) => Transformed::yes(Expr::Column(
+                    datafusion::common::Column::new_unqualified(c.name),
+                )),
+                other => Transformed::no(other),
+            })
+        })?
+        .data)
 }
 
 /// Split the joined output (row-index column first) into 0-based physical indexes and the
