@@ -600,6 +600,19 @@ struct ProcessedPredicate<'a> {
     pub parquet_predicate: Option<&'a Expr>,
 }
 
+/// Whether every column referenced by `expr` is a top-level primitive column in the table's
+/// logical schema. Kernel data skipping can only resolve primitive columns; predicates over
+/// List/Map/Struct/Variant columns must not be handed to the kernel (it errors on them).
+fn all_refs_data_skippable(expr: &Expr, config: &TableConfiguration) -> bool {
+    let schema = config.logical_schema();
+    expr.column_refs().iter().all(|c| {
+        matches!(
+            schema.field(&c.name).map(|f| f.data_type()),
+            Some(KernelDataType::Primitive(_))
+        )
+    })
+}
+
 fn process_predicate<'a>(
     expr: &'a Expr,
     config: &TableConfiguration,
@@ -627,8 +640,15 @@ fn process_predicate<'a>(
     // into the parquet scan, if the table has materialized partition columns
     let _has_partition_data = config.is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
+    // Kernel data skipping only resolves primitive columns. A predicate touching a
+    // List/Map/Struct/Variant column (e.g. `hashes IS NOT NULL`) makes the kernel raise
+    // "Predicate references unknown column" during scan planning. This especially bites
+    // deletion-vector tables, where parquet pushdown is disabled so such predicates would
+    // otherwise route to the kernel. Leave them as a DataFusion post-scan filter instead.
+    let refs_data_skippable = all_refs_data_skippable(expr, config);
+
     // Try to convert the expression into a kernel predicate
-    if let Ok(kernel_predicate) = to_delta_predicate(expr) {
+    if refs_data_skippable && let Ok(kernel_predicate) = to_delta_predicate(expr) {
         let (pushdown, parquet_predicate) = if only_partition_refs {
             // All references are to partition columns so the kernel
             // scan can fully handle the predicate and return exact results
