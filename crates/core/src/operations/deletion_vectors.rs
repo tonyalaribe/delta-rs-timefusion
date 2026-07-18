@@ -282,6 +282,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dv_delete_all_rows_in_file_reads_empty() -> DeltaResult<()> {
+        // Masking every row in a file (cardinality == numRecords) must yield an empty
+        // read, not an error or resurrected rows.
+        let table = make_table().await;
+        let table = commit_dv(table, (0..10).collect()).await?;
+        let data = get_data_sorted(&table, "value").await;
+        assert!(sorted_values(&data).is_empty(), "fully-masked file should read empty");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn full_vacuum_keeps_live_dv_files_and_preserves_deletes() -> DeltaResult<()> {
         use crate::operations::vacuum::{VacuumBuilder, VacuumMode};
         use object_store::ObjectStore as _;
