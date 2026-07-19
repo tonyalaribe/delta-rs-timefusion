@@ -430,6 +430,7 @@ mod tests {
             source_schema,
             target_predicate: None,
             join_predicate: col("target.id").eq(col("source.sid")),
+            equi_keys: vec![],
             updates: vec![("value".to_string(), col("source.newval"))],
             target_alias: "target".to_string(),
             source_alias: "source".to_string(),

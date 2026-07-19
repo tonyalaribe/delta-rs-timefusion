@@ -310,20 +310,30 @@ fn to_binary_op(op: Operator) -> Result<BinaryExpressionOp> {
     }
 }
 
-/// Helper function to flatten nested AND/OR expressions into a single junction expression
+/// Flatten a same-op AND/OR spine into a single junction's operands.
+///
+/// Iterative on purpose: `disjunction`/`conjunction` (and the InList lowering in
+/// [`rewrite_in_list_expr_for_kernel`]) build *left-deep* chains, so an `IN` list
+/// of N literals becomes an N-deep spine. A recursive walk overflowed the tokio
+/// worker stack on real key-prune filters (thousands of join keys) — SIGABRT in
+/// prod. The stack here is explicit; opposite-op subtrees are still handled by
+/// `to_delta_predicate`, which re-enters this loop, so depth grows only per
+/// op-alternation (shallow), never per element.
 fn flatten_junction_expr(expr: &Expr, target_op: Operator) -> Result<Vec<Predicate>> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { op, left, right }) if *op == target_op => {
-            let mut left_exprs = flatten_junction_expr(left.as_ref(), target_op)?;
-            let mut right_exprs = flatten_junction_expr(right.as_ref(), target_op)?;
-            left_exprs.append(&mut right_exprs);
-            Ok(left_exprs)
-        }
-        _ => {
-            let delta_expr = to_delta_predicate(expr)?;
-            Ok(vec![delta_expr])
+    let mut preds = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        match node {
+            // Push right then left so the left branch is processed next,
+            // preserving left-to-right operand order.
+            Expr::BinaryExpr(BinaryExpr { op, left, right }) if *op == target_op => {
+                stack.push(right.as_ref());
+                stack.push(left.as_ref());
+            }
+            _ => preds.push(to_delta_predicate(node)?),
         }
     }
+    Ok(preds)
 }
 
 fn to_junction_op(op: Operator) -> JunctionPredicateOp {
@@ -437,6 +447,25 @@ mod tests {
                 assert_string_inequality_predicate(&junction.preds[1], "part", "c");
             }
             other => panic!("Expected AND junction, got {:?}", other),
+        }
+    }
+
+    // Regression: a large `IN (...)` (real DV key-prune filters carry thousands
+    // of join keys) lowers to a left-deep OR spine; a recursive flatten overflowed
+    // the tokio worker stack in prod (SIGABRT). Conversion must stay iterative.
+    #[test]
+    fn test_large_in_list_does_not_overflow_stack() {
+        let n = 8192;
+        let items: Vec<Expr> = (0..n).map(|i| lit(format!("k{i}"))).collect();
+        let expr = col("span_id").in_list(items, false);
+        match to_delta_predicate(&expr).unwrap() {
+            Predicate::Junction(j) => {
+                assert_eq!(j.op, JunctionPredicateOp::Or);
+                assert_eq!(j.preds.len(), n);
+                assert_string_equality_predicate(&j.preds[0], "span_id", "k0");
+                assert_string_equality_predicate(&j.preds[n - 1], "span_id", &format!("k{}", n - 1));
+            }
+            other => panic!("Expected OR junction, got {:?}", other),
         }
     }
 
