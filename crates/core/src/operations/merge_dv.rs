@@ -14,8 +14,9 @@
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
-use datafusion::common::exec_datafusion_err;
+use datafusion::common::{exec_datafusion_err, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{col, Expr, JoinType, LogicalPlanBuilder};
 use datafusion::physical_plan::collect;
 use parquet::file::properties::WriterProperties;
@@ -47,6 +48,11 @@ pub struct MergeDvUpdate {
     /// Full join condition (equi-join keys AND the user predicate), referencing the
     /// `target_alias` / `source_alias` qualifiers.
     pub join_predicate: Expr,
+    /// `(target_column, source_column)` equi-join key pairs. Used to derive a
+    /// scan-level `target.k IN (distinct source values)` filter so parquet bloom
+    /// filters prune files/row-groups that hold none of the source keys — turning
+    /// a whole-window scan into a few-file scan. Empty = no key pruning.
+    pub equi_keys: Vec<(String, String)>,
     /// `(target_column, value_expr)` assignments; `value_expr` references the aliases.
     pub updates: Vec<(String, Expr)>,
     pub target_alias: String,
@@ -87,6 +93,50 @@ pub async fn merge_update_with_deletion_vectors(
     Ok((DeltaTable::new_with_state(log_store, commit.snapshot()), num_updated))
 }
 
+/// Cap on distinct key values pushed as an IN-filter: past this the planner cost
+/// of a huge `InList` outweighs the pruning benefit, so we skip it and scan all
+/// candidate files (the pre-existing behavior).
+const KEY_PRUNE_MAX_VALUES: usize = 8192;
+
+/// Build a scan-level `target.k IN (distinct source values)` predicate (AND-ed
+/// over the equi-keys) so parquet bloom-filter + stats pruning skips files and
+/// row-groups holding none of the source keys. Sound: the IN only removes target
+/// rows the equi-join would reject anyway, and bloom filters never false-negative.
+/// Returns `None` (scan all) when a key column is missing, all-null, or the
+/// distinct set exceeds [`KEY_PRUNE_MAX_VALUES`].
+fn build_key_prune_filter(equi_keys: &[(String, String)], source_batches: &[RecordBatch], target_alias: &str) -> Option<Expr> {
+    let mut acc: Option<Expr> = None;
+    for (tgt, src) in equi_keys {
+        let mut seen = std::collections::HashSet::new();
+        let mut list: Vec<Expr> = Vec::new();
+        for batch in source_batches {
+            let idx = batch.schema().index_of(src).ok()?;
+            let arr = batch.column(idx);
+            for row in 0..arr.len() {
+                if arr.is_null(row) {
+                    continue;
+                }
+                let sv = ScalarValue::try_from_array(arr, row).ok()?;
+                if seen.insert(sv.clone()) {
+                    if list.len() >= KEY_PRUNE_MAX_VALUES {
+                        return None;
+                    }
+                    list.push(Expr::Literal(sv, None));
+                }
+            }
+        }
+        if list.is_empty() {
+            return None;
+        }
+        let in_list = Expr::InList(InList::new(Box::new(col(format!("{target_alias}.{tgt}"))), list, false));
+        acc = Some(match acc {
+            None => in_list,
+            Some(a) => a.and(in_list),
+        });
+    }
+    acc
+}
+
 async fn collect_merge_dv_actions(
     log_store: &LogStoreRef,
     snapshot: &EagerSnapshot,
@@ -99,6 +149,9 @@ async fn collect_merge_dv_actions(
     if matched_adds.is_empty() {
         return Ok((vec![], 0));
     }
+
+    // Scan-level key filter: bloom-prune files/row-groups holding no source key.
+    let key_prune_filter = build_key_prune_filter(&op.equi_keys, &op.source_batches, &op.target_alias);
 
     let table = DeltaTable::new_with_state(log_store.clone(), DeltaTableState {
         snapshot: snapshot.clone(),
@@ -122,12 +175,15 @@ async fn collect_merge_dv_actions(
             .with_adds([add.clone()])
             .build()
             .await?;
-        let target_plan = LogicalPlanBuilder::scan(
+        let mut target_builder = LogicalPlanBuilder::scan(
             op.target_alias.as_str(),
             provider_as_source(Arc::new(provider)),
             None,
-        )?
-        .build()?;
+        )?;
+        if let Some(filter) = &key_prune_filter {
+            target_builder = target_builder.filter(filter.clone())?;
+        }
+        let target_plan = target_builder.build()?;
         let source_plan = LogicalPlanBuilder::scan(
             op.source_alias.as_str(),
             provider_as_source(source.clone()),
@@ -329,6 +385,23 @@ mod tests {
         ])
         .unwrap();
         (vec![batch], schema)
+    }
+
+    #[test]
+    fn key_prune_filter_builds_in_list_and_bails_gracefully() {
+        let (batches, _) = source_batch();
+        // Distinct source key values become `target.id IN (...)`.
+        let f = build_key_prune_filter(&[("id".to_string(), "sid".to_string())], &batches, "target").expect("filter");
+        match f {
+            Expr::InList(il) => {
+                assert_eq!(il.list.len(), 2, "one InList entry per distinct source key");
+                assert!(!il.negated);
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
+        // No equi-keys, or a key column absent from the source → no filter (scan all).
+        assert!(build_key_prune_filter(&[], &batches, "target").is_none());
+        assert!(build_key_prune_filter(&[("id".to_string(), "missing".to_string())], &batches, "target").is_none());
     }
 
     #[tokio::test]
