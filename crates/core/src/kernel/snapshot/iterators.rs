@@ -33,6 +33,7 @@ const FIELD_NAME_SIZE: &str = "size";
 const FIELD_NAME_MODIFICATION_TIME: &str = "modificationTime";
 const FIELD_NAME_FILE_CONSTANT_VALUES: &str = "fileConstantValues";
 const FIELD_NAME_RAW_PARTITION_VALUES: &str = "partitionValues";
+const FIELD_NAME_TAGS: &str = "tags";
 const FIELD_NAME_STATS: &str = "stats";
 const FIELD_NAME_STATS_PARSED: &str = "stats_parsed";
 const FIELD_NAME_PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
@@ -216,6 +217,18 @@ impl LogicalFileView {
         self.raw_partition_values()
             .filter(|partitions| partitions.is_valid(self.index))
             .and_then(|partitions| collect_string_map(&partitions.value(self.index)))
+            .unwrap_or_default()
+    }
+
+    /// Returns the persisted Add-action tags for this file.
+    pub fn tags(&self) -> HashMap<String, Option<String>> {
+        self.files
+            .column_by_name(FIELD_NAME_FILE_CONSTANT_VALUES)
+            .and_then(|col| col.as_struct_opt())
+            .and_then(|file_constants| file_constants.column_by_name(FIELD_NAME_TAGS))
+            .and_then(|col| col.as_map_opt())
+            .filter(|tags| tags.is_valid(self.index))
+            .and_then(|tags| collect_string_map(&tags.value(self.index)))
             .unwrap_or_default()
     }
 
