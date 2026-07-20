@@ -317,6 +317,8 @@ pub struct OptimizeBuilder<'a> {
     /// Exact parquet paths to rewrite. Takes precedence over bin-packing for
     /// sorted dedup rewrites.
     selected_files: Option<&'a [String]>,
+    /// Bin selected files by target size instead of merging them as one rewrite.
+    selected_files_binned: bool,
     /// Desired file size after bin-packing files
     target_size: Option<NonZeroU64>,
     /// Properties passed to underlying parquet writer
@@ -351,6 +353,7 @@ impl<'a> OptimizeBuilder<'a> {
             log_store,
             filters: &[],
             selected_files: None,
+            selected_files_binned: false,
             target_size: None,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
@@ -381,6 +384,14 @@ impl<'a> OptimizeBuilder<'a> {
     /// every supplied file is retained, even if it exceeds the target size.
     pub fn with_files(mut self, files: &'a [String]) -> Self {
         self.selected_files = Some(files);
+        self
+    }
+
+    /// Rewrite selected files in target-sized bins. Unlike [`Self::with_files`],
+    /// this never turns a long hot tail into one unbounded rewrite.
+    pub fn with_binned_files(mut self, files: &'a [String]) -> Self {
+        self.selected_files = Some(files);
+        self.selected_files_binned = true;
         self
     }
 
@@ -486,12 +497,13 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                     cdc: false,
                 },
             )?;
-            let plan = create_merge_plan(
+            let plan = create_merge_plan_with_binned_files(
                 &this.log_store,
                 this.optimize_type,
                 &snapshot,
                 this.filters,
                 this.selected_files.as_deref(),
+                this.selected_files_binned,
                 this.target_size.to_owned(),
                 writer_properties,
                 session,
@@ -667,6 +679,9 @@ pub struct MergeTaskParameters {
     num_indexed_cols: DataSkippingNumIndexedCols,
     /// Stats columns, specific columns to collect stats from, takes precedence over num_indexed_cols
     stats_columns: Option<Vec<String>>,
+    /// SortBy writes carry this tag in their Add actions so hot-tail schedulers
+    /// can distinguish sorted runs from newly appended files after a restart.
+    sorted_output: bool,
 }
 
 /// A stream of record batches, with a ParquetError on failure.
@@ -790,7 +805,11 @@ impl MergePlan {
 
         let add_actions = writer.close().await?.into_iter().map(|mut add| {
             add.data_change = false;
-
+            if task_parameters.sorted_output {
+                add.tags
+                    .get_or_insert_default()
+                    .insert("delta-rs.optimize.sort_by".into(), Some("true".into()));
+            }
             let size = add.size;
 
             partial_metrics.num_files_added += 1;
@@ -1284,10 +1303,39 @@ pub async fn create_merge_plan(
     writer_properties: WriterProperties,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
+    create_merge_plan_with_binned_files(
+        log_store,
+        optimize_type,
+        snapshot,
+        filters,
+        selected_files,
+        false,
+        target_size,
+        writer_properties,
+        session,
+    )
+    .await
+}
+
+async fn create_merge_plan_with_binned_files(
+    log_store: &dyn LogStore,
+    optimize_type: OptimizeType,
+    snapshot: &EagerSnapshot,
+    filters: &[PartitionFilter],
+    selected_files: Option<&[String]>,
+    selected_files_binned: bool,
+    target_size: Option<NonZeroU64>,
+    writer_properties: WriterProperties,
+    session: SessionState,
+) -> Result<MergePlan, DeltaTableError> {
     let target_size = target_size.unwrap_or_else(|| snapshot.table_properties().target_file_size());
     let _ = optimize_target_size_to_i64(target_size)?;
     let partitions_keys = snapshot.metadata().partition_columns();
 
+    let sorted_output = matches!(
+        &optimize_type,
+        OptimizeType::SortBy(_) | OptimizeType::SortByDedup(_, _)
+    );
     let (operations, metrics, planner_stats) = match optimize_type {
         OptimizeType::Compact => {
             info!("building compaction plan");
@@ -1314,6 +1362,7 @@ pub async fn create_merge_plan(
                 partitions_keys,
                 filters,
                 selected_files,
+                selected_files_binned,
                 target_size,
             )
             .await?
@@ -1328,6 +1377,7 @@ pub async fn create_merge_plan(
                 partitions_keys,
                 filters,
                 selected_files,
+                selected_files_binned,
                 target_size,
             )
             .await?
@@ -1363,6 +1413,7 @@ pub async fn create_merge_plan(
                 .data_skipping_stats_columns
                 .as_ref()
                 .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
+            sorted_output,
         }),
         read_table_version: snapshot.version(),
         read_session: Arc::new(session),
@@ -1717,6 +1768,7 @@ async fn build_sort_plan(
     partition_keys: &[String],
     filters: &[PartitionFilter],
     selected_files: Option<&[String]>,
+    selected_files_binned: bool,
     target_size: NonZeroU64,
 ) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
     if sort_columns.is_empty() {
@@ -1800,7 +1852,7 @@ async fn build_sort_plan(
 
     let mut operations: HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)> = HashMap::new();
     for (part, (partition, _, files)) in partition_files {
-        let (merge_bins, partition_stats) = if selected.is_some() {
+        let (merge_bins, partition_stats) = if selected.is_some() && !selected_files_binned {
             let mut bin = MergeBin::new();
             for file in files {
                 bin.add(file.add);
