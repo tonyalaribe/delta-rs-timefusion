@@ -82,6 +82,8 @@ pub struct DeltaScanConfigBuilder {
     pub(super) wrap_partition_values: Option<bool>,
     /// Whether to push down filter in end result or just prune the files
     pub(super) enable_parquet_pushdown: bool,
+    /// Opt in to pushdown even under Deletion Vectors (read-only scans only).
+    pub(super) pushdown_with_deletion_vectors: bool,
     /// Schema to scan table with
     pub(super) schema: Option<SchemaRef>,
 }
@@ -93,6 +95,7 @@ impl Default for DeltaScanConfigBuilder {
             file_column_name: None,
             wrap_partition_values: None,
             enable_parquet_pushdown: true,
+            pushdown_with_deletion_vectors: false,
             schema: None,
         }
     }
@@ -132,6 +135,13 @@ impl DeltaScanConfigBuilder {
         self
     }
 
+    /// Opt in to parquet pushdown even under Deletion Vectors. READ-ONLY scans
+    /// only — never for scans feeding a DV write op (see DeltaScanConfig docs).
+    pub fn with_pushdown_with_deletion_vectors(mut self, allow: bool) -> Self {
+        self.pushdown_with_deletion_vectors = allow;
+        self
+    }
+
     /// Use the provided [SchemaRef] for the [`crate::delta_datafusion::DeltaScanNext`]
     pub fn with_schema(mut self, schema: SchemaRef) -> Self {
         self.schema = Some(schema);
@@ -153,6 +163,7 @@ impl DeltaScanConfigBuilder {
             file_column_name,
             wrap_partition_values: self.wrap_partition_values.unwrap_or(true),
             enable_parquet_pushdown: self.enable_parquet_pushdown,
+            pushdown_with_deletion_vectors: self.pushdown_with_deletion_vectors,
             schema: self.schema.clone(),
             schema_force_view_types: true,
         })
@@ -168,6 +179,15 @@ pub struct DeltaScanConfig {
     pub wrap_partition_values: bool,
     /// Allow pushdown of the scan filter, defaults to true
     pub enable_parquet_pushdown: bool,
+    /// Opt-in: allow parquet predicate pushdown even when the table has the
+    /// Deletion Vectors feature. Pushdown is normally disabled under DV because
+    /// DV write ops (UPDATE/DELETE/MERGE) compute selection masks by ROW POSITION
+    /// and a pushed predicate would shift positions. READ-ONLY scans have no such
+    /// constraint, so the read path may set this to reclaim row-group/page
+    /// pruning (recent-window dashboard queries). Defaults to false so every
+    /// write path stays correct without opting out. See scan/plan.rs gate.
+    #[serde(default)]
+    pub pushdown_with_deletion_vectors: bool,
     /// If true, parquet reader will read columns of `Utf8`/`Utf8Large`
     /// with Utf8View, and `Binary`/`BinaryLarge` with `BinaryView`
     pub schema_force_view_types: bool,
@@ -188,6 +208,7 @@ impl DeltaScanConfig {
             file_column_name: None,
             wrap_partition_values: true,
             enable_parquet_pushdown: true,
+            pushdown_with_deletion_vectors: false,
             schema_force_view_types: true,
             schema: None,
         }
@@ -201,6 +222,7 @@ impl DeltaScanConfig {
             file_column_name: None,
             wrap_partition_values: true,
             enable_parquet_pushdown: config_options.execution.parquet.pushdown_filters,
+            pushdown_with_deletion_vectors: false,
             schema_force_view_types: config_options.execution.parquet.schema_force_view_types,
             schema: None,
         }
@@ -221,6 +243,14 @@ impl DeltaScanConfig {
     /// Allow pushdown of the scan filter
     pub fn with_parquet_pushdown(mut self, pushdown: bool) -> Self {
         self.enable_parquet_pushdown = pushdown;
+        self
+    }
+
+    /// Opt in to parquet pushdown even under Deletion Vectors. ONLY safe for
+    /// read-only scans (see field docs / scan/plan.rs gate) — never for scans
+    /// that feed a DV write op.
+    pub fn with_pushdown_with_deletion_vectors(mut self, allow: bool) -> Self {
+        self.pushdown_with_deletion_vectors = allow;
         self
     }
 
@@ -251,6 +281,8 @@ pub struct TableProviderBuilder {
     file_skipping_predicates: Option<Vec<Expr>>,
     file_selection: Option<next::FileSelection>,
     row_ordinal_selections: Option<std::collections::HashMap<String, Vec<u64>>>,
+    /// Opt in to parquet pushdown even under Deletion Vectors (read-only scans).
+    pushdown_with_deletion_vectors: bool,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -287,7 +319,15 @@ impl TableProviderBuilder {
             file_skipping_predicates: None,
             file_selection: None,
             row_ordinal_selections: None,
+            pushdown_with_deletion_vectors: false,
         }
+    }
+
+    /// Opt in to parquet pushdown even under Deletion Vectors. READ-ONLY scans
+    /// only — the scan must not feed a DV write op (see DeltaScanConfig docs).
+    pub fn with_pushdown_with_deletion_vectors(mut self, allow: bool) -> Self {
+        self.pushdown_with_deletion_vectors = allow;
+        self
     }
 
     /// Provide the log store to use for the table provider
@@ -397,6 +437,7 @@ impl TableProviderBuilder {
             file_skipping_predicates,
             file_selection,
             row_ordinal_selections,
+            pushdown_with_deletion_vectors,
         } = self;
 
         let mut config = session
@@ -404,6 +445,7 @@ impl TableProviderBuilder {
             .map_or_else(DeltaScanConfig::new, |session| {
                 DeltaScanConfig::new_from_session(session.as_ref())
             });
+        config.pushdown_with_deletion_vectors = pushdown_with_deletion_vectors;
         if let Some(file_column) = file_column {
             config = config.with_file_column_name(file_column);
         }
