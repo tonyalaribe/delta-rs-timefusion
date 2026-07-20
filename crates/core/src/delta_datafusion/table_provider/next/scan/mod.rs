@@ -462,8 +462,16 @@ async fn get_data_scan_plan(
 
     // TODO(roeap); not sure exactly how row tracking is implemented in kernel right now
     // so leaving predicate as None for now until we are sure this is safe to do.
+    //
+    // Deletion vectors are applied as per-file keep-masks indexed by ROW POSITION
+    // (`exec::consume_dv_mask`). Even when a read scan opts in to pushdown under DV
+    // (pushdown_with_deletion_vectors), a file that actually carries a keep-mask
+    // must NOT get the predicate pushed: pushdown filters rows before the mask is
+    // applied, shifting positions so the mask hides the wrong rows (a deleted row
+    // reappears). Drop the predicate when this scan carries any DV keep-mask; the
+    // common DV-free scans (e.g. the freshly compacted hot tail) still push down.
     let table_config = scan_plan.table_configuration();
-    let predicate = if table_config.is_feature_enabled(&TableFeature::RowTracking) {
+    let predicate = if table_config.is_feature_enabled(&TableFeature::RowTracking) || !dvs.is_empty() {
         None
     } else {
         scan_plan.parquet_predicate.as_ref()
