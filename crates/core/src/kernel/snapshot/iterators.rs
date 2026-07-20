@@ -278,6 +278,19 @@ impl LogicalFileView {
             .map(|s| round_ms_datetimes(s, &ceil_datetime))
     }
 
+    /// Min value of a timestamp/long stats column as an `i64` (timestamp in
+    /// microseconds, or the raw long). `None` if the column has no stats or is
+    /// not a timestamp/long. Used by hot-tail compaction to bin files by event
+    /// time so compacted runs come out time-disjoint (file-range prunable).
+    pub fn stat_min_i64(&self, column: &str) -> Option<i64> {
+        scalar_struct_field_i64(&self.min_values()?, column)
+    }
+
+    /// Max value of a timestamp/long stats column as an `i64` — see [`Self::stat_min_i64`].
+    pub fn stat_max_i64(&self, column: &str) -> Option<i64> {
+        scalar_struct_field_i64(&self.max_values()?, column)
+    }
+
     /// Return the underlying [DeletionVectorDescriptor] if it exists.
     ///
     /// **NOTE**: THis API may be removed in the future without deprecation warnings as the
@@ -367,6 +380,20 @@ fn ceil_datetime(v: i64, ratio: i64) -> i64 {
         ((v as f64 / ratio as f64).floor() as i64 + 1) * ratio
     } else {
         v
+    }
+}
+
+/// Pull a single column's value out of a min/max stats `Scalar::Struct` and
+/// coerce it to `i64` (timestamp microseconds, or a raw long). Returns `None`
+/// for absent columns or non-numeric-temporal types.
+fn scalar_struct_field_i64(scalar: &Scalar, column: &str) -> Option<i64> {
+    let Scalar::Struct(sd) = scalar else { return None };
+    let idx = sd.fields().iter().position(|f| f.name().as_str() == column)?;
+    match sd.values().get(idx)? {
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(v) => Some(v / 1_000),
+        Scalar::Timestamp(v) | Scalar::TimestampNtz(v) | Scalar::Long(v) => Some(*v),
+        _ => None,
     }
 }
 
