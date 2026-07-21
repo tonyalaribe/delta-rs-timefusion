@@ -450,6 +450,18 @@ impl TableProviderBuilder {
             config = config.with_file_column_name(file_column);
         }
 
+        // Write-op scans (UPDATE/DELETE/MERGE) must NOT push the predicate into the
+        // parquet row scan: pushing it filters rows and shifts row positions,
+        // corrupting the row-index mapping that deletion-vector masking and file
+        // rewrites rely on. Two independent signals mark such a scan — a retained
+        // row-index column (positions are read out) and file-skipping predicates
+        // (predicate is meant to skip whole files, not filter rows). User read scans
+        // set neither, so they keep parquet pushdown (page-index + row pruning) — the
+        // recent-window query fast path. Defense-in-depth beneath the opt-in gate.
+        if row_index_column.is_some() || file_skipping_predicates.is_some() {
+            config = config.with_parquet_pushdown(false);
+        }
+
         let snapshot = match snapshot {
             Some(wrapper) => wrapper,
             None => {
