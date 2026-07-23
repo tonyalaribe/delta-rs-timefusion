@@ -762,24 +762,20 @@ mod tests {
         checker.check_conflicts()
     }
 
-    // Regression: prod 2026-07-22 — hot-tail light OPTIMIZE on today's partition
-    // lost every OCC race against ingest flushes. The snapshot-isolation
-    // downgrade for no-data-change commits inspected the WINNING commit's
-    // actions (always data_change=true for an append) instead of the
-    // committing transaction's own, so it never applied.
-    #[tokio::test]
+    // A no-data-change OPTIMIZE (remove + re-add of `file_read` with
+    // data_change=false) committing against the given concurrent actions.
+    // Exercises the snapshot-isolation downgrade, which `execute_test` can't
+    // (it passes no operation).
     #[cfg(feature = "datafusion")]
-    async fn test_optimize_not_aborted_by_concurrent_append() {
+    async fn execute_optimize_test(concurrent: Vec<Action>) -> Result<(), CommitConflictError> {
+        use crate::table::state::DeltaTableState;
+
         let file_read = simple_add(true, "1", "10");
         let mut setup_actions = init_table_actions();
         setup_actions.push(file_read.clone().into());
-        let state = crate::table::state::DeltaTableState::from_actions(setup_actions)
-            .await
-            .unwrap();
+        let state = DeltaTableState::from_actions(setup_actions).await.unwrap();
         let snapshot = state.snapshot();
         let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
-
-        // Compaction rewrite: remove + re-add with data_change=false.
         let mut compacted = simple_add(true, "1", "10");
         compacted.data_change = false;
         let optimize_actions: Vec<Action> = vec![
@@ -792,17 +788,26 @@ mod tests {
             &optimize_actions,
             false,
         );
-        // Concurrent ingest flush appends new data matching the read predicate.
         let summary = WinningCommitSummary {
-            actions: vec![simple_add(true, "1", "10").into()],
+            actions: concurrent,
             commit_info: None,
         };
         let operation = DeltaOperation::Optimize {
             predicate: None,
             target_size: 0,
         };
-        let checker = ConflictChecker::new(transaction_info, summary, Some(&operation));
-        checker.check_conflicts().unwrap();
+        ConflictChecker::new(transaction_info, summary, Some(&operation)).check_conflicts()
+    }
+
+    // Regression (prod 2026-07-22): a concurrent ingest append must not abort
+    // a no-data-change OPTIMIZE — the downgrade keys off the committing txn's
+    // actions, not the winning commit's.
+    #[tokio::test]
+    #[cfg(feature = "datafusion")]
+    async fn test_optimize_not_aborted_by_concurrent_append() {
+        execute_optimize_test(vec![simple_add(true, "1", "10").into()])
+            .await
+            .unwrap();
     }
 
     // The true conflict must still abort: a concurrent txn removing (with
@@ -811,37 +816,8 @@ mod tests {
     #[cfg(feature = "datafusion")]
     async fn test_optimize_aborted_by_concurrent_source_removal() {
         let file_read = simple_add(true, "1", "10");
-        let mut setup_actions = init_table_actions();
-        setup_actions.push(file_read.clone().into());
-        let state = crate::table::state::DeltaTableState::from_actions(setup_actions)
-            .await
-            .unwrap();
-        let snapshot = state.snapshot();
-        let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
-
-        let mut compacted = simple_add(true, "1", "10");
-        compacted.data_change = false;
-        let optimize_actions: Vec<Action> = vec![
-            ActionFactory::remove(&file_read, false).into(),
-            compacted.into(),
-        ];
-        let transaction_info = TransactionInfo::new(
-            conflict_read_set,
-            Some(col("value").gt(lit::<i32>(0))),
-            &optimize_actions,
-            false,
-        );
-        let summary = WinningCommitSummary {
-            actions: vec![ActionFactory::remove(&file_read, true).into()],
-            commit_info: None,
-        };
-        let operation = DeltaOperation::Optimize {
-            predicate: None,
-            target_size: 0,
-        };
-        let checker = ConflictChecker::new(transaction_info, summary, Some(&operation));
         assert!(matches!(
-            checker.check_conflicts(),
+            execute_optimize_test(vec![ActionFactory::remove(&file_read, true).into()]).await,
             Err(CommitConflictError::ConcurrentDeleteRead)
         ));
     }
