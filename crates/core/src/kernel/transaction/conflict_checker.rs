@@ -373,10 +373,19 @@ impl<'a> ConflictChecker<'a> {
         winning_commit_summary: WinningCommitSummary,
         operation: Option<&DeltaOperation>,
     ) -> ConflictChecker<'a> {
+        // The downgrade decision is about the COMMITTING transaction being
+        // no-data-change (OPTIMIZE/compaction): such a commit may ignore
+        // concurrent appends (they aren't inputs to the rewrite) while still
+        // conflicting on removals of its source files. Inspecting the winning
+        // commit's actions here (as upstream does) makes the downgrade never
+        // apply on busy tables — any concurrent ingest append has
+        // data_change=true, so hot-partition compaction lost every OCC race
+        // (prod 2026-07-22). Reference impl checks the current txn's actions:
+        // delta-io/delta OptimisticTransaction.scala canDowngradeToSnapshotIsolation.
         let isolation_level = operation
             .and_then(|op| {
                 if can_downgrade_to_snapshot_isolation(
-                    &winning_commit_summary.actions,
+                    transaction_info.actions,
                     op,
                     &transaction_info
                         .read_snapshot
@@ -723,8 +732,11 @@ pub(super) fn can_downgrade_to_snapshot_isolation<'a>(
     let mut has_non_file_actions = false;
     for action in actions {
         match action {
-            Action::Add(act) if act.data_change => data_changed = true,
-            Action::Remove(rem) if rem.data_change => data_changed = true,
+            // data_change=false Add/Remove (compaction rewrites) are still
+            // file actions — routing them to the non-file arm vetoed the
+            // downgrade for exactly the no-data-change commits it exists for.
+            Action::Add(act) => data_changed |= act.data_change,
+            Action::Remove(rem) => data_changed |= rem.data_change,
             _ => has_non_file_actions = true,
         }
     }
