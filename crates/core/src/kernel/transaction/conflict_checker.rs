@@ -673,6 +673,11 @@ pub(super) fn can_downgrade_to_snapshot_isolation<'a>(
             // downgrade for exactly the no-data-change commits it exists for.
             Action::Add(act) => data_changed |= act.data_change,
             Action::Remove(rem) => data_changed |= rem.data_change,
+            // CommitData::new prepends CommitInfo to every commit; it's
+            // provenance metadata, not a table-state change, so it must not
+            // count as a non-file action (it made this fn return false for
+            // ALL real commits).
+            Action::CommitInfo(_) => {}
             _ => has_non_file_actions = true,
         }
     }
@@ -783,7 +788,11 @@ mod tests {
         let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
         let mut compacted = simple_add(true, "1", "10");
         compacted.data_change = false;
+        // CommitData::new prepends CommitInfo to every commit's actions — the
+        // downgrade must not treat it as a metadata action (prod 2026-07-23:
+        // it vetoed the downgrade on every real commit).
         let optimize_actions: Vec<Action> = vec![
+            Action::CommitInfo(Default::default()),
             ActionFactory::remove(&file_read, false).into(),
             compacted.into(),
         ];
