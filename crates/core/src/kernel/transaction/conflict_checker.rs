@@ -766,11 +766,16 @@ mod tests {
     // data_change=false) committing against the given concurrent actions.
     // Exercises the snapshot-isolation downgrade, which `execute_test` can't
     // (it passes no operation).
+    // `concurrent` receives the read file so tests can target it (each
+    // `simple_add` call generates a distinct file path).
     #[cfg(feature = "datafusion")]
-    async fn execute_optimize_test(concurrent: Vec<Action>) -> Result<(), CommitConflictError> {
+    async fn execute_optimize_test(
+        concurrent: impl FnOnce(&Add) -> Vec<Action>,
+    ) -> Result<(), CommitConflictError> {
         use crate::table::state::DeltaTableState;
 
         let file_read = simple_add(true, "1", "10");
+        let concurrent = concurrent(&file_read);
         let mut setup_actions = init_table_actions();
         setup_actions.push(file_read.clone().into());
         let state = DeltaTableState::from_actions(setup_actions).await.unwrap();
@@ -805,7 +810,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "datafusion")]
     async fn test_optimize_not_aborted_by_concurrent_append() {
-        execute_optimize_test(vec![simple_add(true, "1", "10").into()])
+        execute_optimize_test(|_| vec![simple_add(true, "1", "10").into()])
             .await
             .unwrap();
     }
@@ -815,9 +820,8 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "datafusion")]
     async fn test_optimize_aborted_by_concurrent_source_removal() {
-        let file_read = simple_add(true, "1", "10");
         assert!(matches!(
-            execute_optimize_test(vec![ActionFactory::remove(&file_read, true).into()]).await,
+            execute_optimize_test(|f| vec![ActionFactory::remove(f, true).into()]).await,
             Err(CommitConflictError::ConcurrentDeleteRead)
         ));
     }
