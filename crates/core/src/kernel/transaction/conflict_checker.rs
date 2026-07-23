@@ -372,10 +372,19 @@ impl<'a> ConflictChecker<'a> {
         winning_commit_summary: WinningCommitSummary,
         operation: Option<&DeltaOperation>,
     ) -> ConflictChecker<'a> {
+        // The downgrade decision is about the COMMITTING transaction being
+        // no-data-change (OPTIMIZE/compaction): such a commit may ignore
+        // concurrent appends (they aren't inputs to the rewrite) while still
+        // conflicting on removals of its source files. Inspecting the winning
+        // commit's actions here (as upstream does) makes the downgrade never
+        // apply on busy tables — any concurrent ingest append has
+        // data_change=true, so hot-partition compaction lost every OCC race
+        // (prod 2026-07-22). Reference impl checks the current txn's actions:
+        // delta-io/delta OptimisticTransaction.scala canDowngradeToSnapshotIsolation.
         let isolation_level = operation
             .and_then(|op| {
                 if can_downgrade_to_snapshot_isolation(
-                    &winning_commit_summary.actions,
+                    transaction_info.actions,
                     op,
                     &transaction_info
                         .read_snapshot
@@ -659,8 +668,11 @@ pub(super) fn can_downgrade_to_snapshot_isolation<'a>(
     let mut has_non_file_actions = false;
     for action in actions {
         match action {
-            Action::Add(act) if act.data_change => data_changed = true,
-            Action::Remove(rem) if rem.data_change => data_changed = true,
+            // data_change=false Add/Remove (compaction rewrites) are still
+            // file actions — routing them to the non-file arm vetoed the
+            // downgrade for exactly the no-data-change commits it exists for.
+            Action::Add(act) => data_changed |= act.data_change,
+            Action::Remove(rem) => data_changed |= rem.data_change,
             _ => has_non_file_actions = true,
         }
     }
@@ -748,6 +760,90 @@ mod tests {
         };
         let checker = ConflictChecker::new(transaction_info, summary, None);
         checker.check_conflicts()
+    }
+
+    // Regression: prod 2026-07-22 — hot-tail light OPTIMIZE on today's partition
+    // lost every OCC race against ingest flushes. The snapshot-isolation
+    // downgrade for no-data-change commits inspected the WINNING commit's
+    // actions (always data_change=true for an append) instead of the
+    // committing transaction's own, so it never applied.
+    #[tokio::test]
+    #[cfg(feature = "datafusion")]
+    async fn test_optimize_not_aborted_by_concurrent_append() {
+        let file_read = simple_add(true, "1", "10");
+        let mut setup_actions = init_table_actions();
+        setup_actions.push(file_read.clone().into());
+        let state = crate::table::state::DeltaTableState::from_actions(setup_actions)
+            .await
+            .unwrap();
+        let snapshot = state.snapshot();
+        let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
+
+        // Compaction rewrite: remove + re-add with data_change=false.
+        let mut compacted = simple_add(true, "1", "10");
+        compacted.data_change = false;
+        let optimize_actions: Vec<Action> = vec![
+            ActionFactory::remove(&file_read, false).into(),
+            compacted.into(),
+        ];
+        let transaction_info = TransactionInfo::new(
+            conflict_read_set,
+            Some(col("value").gt(lit::<i32>(0))),
+            &optimize_actions,
+            false,
+        );
+        // Concurrent ingest flush appends new data matching the read predicate.
+        let summary = WinningCommitSummary {
+            actions: vec![simple_add(true, "1", "10").into()],
+            commit_info: None,
+        };
+        let operation = DeltaOperation::Optimize {
+            predicate: None,
+            target_size: 0,
+        };
+        let checker = ConflictChecker::new(transaction_info, summary, Some(&operation));
+        checker.check_conflicts().unwrap();
+    }
+
+    // The true conflict must still abort: a concurrent txn removing (with
+    // data_change=true, e.g. dedup/DV-merge) a file the optimize read.
+    #[tokio::test]
+    #[cfg(feature = "datafusion")]
+    async fn test_optimize_aborted_by_concurrent_source_removal() {
+        let file_read = simple_add(true, "1", "10");
+        let mut setup_actions = init_table_actions();
+        setup_actions.push(file_read.clone().into());
+        let state = crate::table::state::DeltaTableState::from_actions(setup_actions)
+            .await
+            .unwrap();
+        let snapshot = state.snapshot();
+        let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
+
+        let mut compacted = simple_add(true, "1", "10");
+        compacted.data_change = false;
+        let optimize_actions: Vec<Action> = vec![
+            ActionFactory::remove(&file_read, false).into(),
+            compacted.into(),
+        ];
+        let transaction_info = TransactionInfo::new(
+            conflict_read_set,
+            Some(col("value").gt(lit::<i32>(0))),
+            &optimize_actions,
+            false,
+        );
+        let summary = WinningCommitSummary {
+            actions: vec![ActionFactory::remove(&file_read, true).into()],
+            commit_info: None,
+        };
+        let operation = DeltaOperation::Optimize {
+            predicate: None,
+            target_size: 0,
+        };
+        let checker = ConflictChecker::new(transaction_info, summary, Some(&operation));
+        assert!(matches!(
+            checker.check_conflicts(),
+            Err(CommitConflictError::ConcurrentDeleteRead)
+        ));
     }
 
     // tests adopted from https://github.com/delta-io/delta/blob/24c025128612a4ae02d0ad958621f928cda9a3ec/core/src/test/scala/org/apache/spark/sql/delta/OptimisticTransactionSuite.scala#L40-L94
