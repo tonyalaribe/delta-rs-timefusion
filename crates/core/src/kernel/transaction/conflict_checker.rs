@@ -737,6 +737,11 @@ pub(super) fn can_downgrade_to_snapshot_isolation<'a>(
             // downgrade for exactly the no-data-change commits it exists for.
             Action::Add(act) => data_changed |= act.data_change,
             Action::Remove(rem) => data_changed |= rem.data_change,
+            // CommitData::new prepends CommitInfo to every commit; it's
+            // provenance metadata, not a table-state change, so it must not
+            // count as a non-file action (it made this fn return false for
+            // ALL real commits).
+            Action::CommitInfo(_) => {}
             _ => has_non_file_actions = true,
         }
     }
