@@ -614,6 +614,7 @@ pub struct CommitBuilder {
     post_commit_hook: Option<PostCommitHookProperties>,
     post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
     operation_id: Uuid,
+    tolerate_concurrent_appends: bool,
 }
 
 impl Default for CommitBuilder {
@@ -626,6 +627,7 @@ impl Default for CommitBuilder {
             post_commit_hook: None,
             post_commit_hook_handler: None,
             operation_id: Uuid::new_v4(),
+            tolerate_concurrent_appends: false,
         }
     }
 }
@@ -661,6 +663,19 @@ impl<'a> CommitBuilder {
         self
     }
 
+    /// Commit under append-tolerant conflict checking: a winning commit that
+    /// only ADDS data files no longer aborts this transaction (the commit loop
+    /// rebases onto the newer version instead), while removed-file, protocol,
+    /// and metadata conflicts still abort. ONLY sound when rows appended
+    /// concurrently can never be inputs to this commit's actions — e.g. a
+    /// merge whose matched rows were all read from the snapshot AND whose
+    /// writer guarantees post-snapshot appends already carry the merged values
+    /// (TimeFusion's buffered mem-leg/flush contract). Off by default.
+    pub fn with_tolerate_concurrent_appends(mut self, tolerate: bool) -> Self {
+        self.tolerate_concurrent_appends = tolerate;
+        self
+    }
+
     /// Set a custom execute handler, for pre and post execution
     pub fn with_post_commit_hook_handler(
         mut self,
@@ -691,6 +706,7 @@ impl<'a> CommitBuilder {
             post_commit_hook: self.post_commit_hook,
             post_commit_hook_handler: self.post_commit_hook_handler,
             operation_id: self.operation_id,
+            tolerate_concurrent_appends: self.tolerate_concurrent_appends,
         }
     }
 }
@@ -704,6 +720,7 @@ pub struct PreCommit<'a> {
     post_commit_hook: Option<PostCommitHookProperties>,
     post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
     operation_id: Uuid,
+    tolerate_concurrent_appends: bool,
 }
 
 impl<'a> std::future::IntoFuture for PreCommit<'a> {
@@ -761,6 +778,7 @@ impl<'a> PreCommit<'a> {
                 post_commit: this.post_commit_hook,
                 post_commit_hook_handler: this.post_commit_hook_handler,
                 operation_id: this.operation_id,
+                tolerate_concurrent_appends: this.tolerate_concurrent_appends,
             })
         })
     }
@@ -776,6 +794,7 @@ pub struct PreparedCommit<'a> {
     post_commit: Option<PostCommitHookProperties>,
     post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
     operation_id: Uuid,
+    tolerate_concurrent_appends: bool,
 }
 
 impl PreparedCommit<'_> {
@@ -904,7 +923,8 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                                 transaction_info,
                                 summary,
                                 Some(&this.data.operation),
-                            );
+                            )
+                            .with_tolerate_concurrent_appends(this.tolerate_concurrent_appends);
 
                             match conflict_checker.check_conflicts() {
                                 Ok(_) => {}

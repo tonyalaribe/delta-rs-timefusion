@@ -528,7 +528,8 @@ pub(crate) fn supports_filters_pushdown(
     // disables predicate pushdown in the read plan.
     let parquet_pushdown_enabled = scan_config.enable_parquet_pushdown
         && !config.is_feature_enabled(&TableFeature::RowTracking)
-        && (scan_config.pushdown_with_deletion_vectors || !config.is_feature_enabled(&TableFeature::DeletionVectors));
+        && (scan_config.pushdown_with_deletion_vectors
+            || !config.is_feature_enabled(&TableFeature::DeletionVectors));
     filter
         .iter()
         .map(|f| {
@@ -565,7 +566,8 @@ fn process_filters(
 
     let parquet_pushdown_enabled = scan_config.enable_parquet_pushdown
         && !config.is_feature_enabled(&TableFeature::RowTracking)
-        && (scan_config.pushdown_with_deletion_vectors || !config.is_feature_enabled(&TableFeature::DeletionVectors));
+        && (scan_config.pushdown_with_deletion_vectors
+            || !config.is_feature_enabled(&TableFeature::DeletionVectors));
     let (parquet, kernel): (Vec<_>, Vec<_>) = filters
         .iter()
         .map(|f| {

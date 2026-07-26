@@ -471,11 +471,12 @@ async fn get_data_scan_plan(
     // reappears). Drop the predicate when this scan carries any DV keep-mask; the
     // common DV-free scans (e.g. the freshly compacted hot tail) still push down.
     let table_config = scan_plan.table_configuration();
-    let predicate = if table_config.is_feature_enabled(&TableFeature::RowTracking) || !dvs.is_empty() {
-        None
-    } else {
-        scan_plan.parquet_predicate.as_ref()
-    };
+    let predicate =
+        if table_config.is_feature_enabled(&TableFeature::RowTracking) || !dvs.is_empty() {
+            None
+        } else {
+            scan_plan.parquet_predicate.as_ref()
+        };
     let file_id_field = scan_plan.contract.file_id_field.clone();
     let pq_plan = get_read_plan(
         session,

@@ -15,8 +15,8 @@ use std::collections::HashSet;
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
 };
-use object_store::path::Path as ObjectStorePath;
 use object_store::ObjectStoreExt as _;
+use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringTreemap;
 use url::Url;
 use uuid::Uuid;
@@ -123,7 +123,11 @@ pub(crate) async fn write_deletion_vectors(
     deletions: Vec<FileDeletion>,
 ) -> DeltaResult<Vec<Action>> {
     let mut actions = Vec::new();
-    for FileDeletion { add, deleted_indexes } in deletions {
+    for FileDeletion {
+        add,
+        deleted_indexes,
+    } in deletions
+    {
         if deleted_indexes.is_empty() {
             continue;
         }
@@ -231,12 +235,15 @@ mod tests {
         let add = single_file_add(&table).await;
         let log_store = table.log_store();
         let root = log_store.root_url();
-        let actions =
-            write_deletion_vectors(log_store.as_ref(), &root, vec![FileDeletion {
+        let actions = write_deletion_vectors(
+            log_store.as_ref(),
+            &root,
+            vec![FileDeletion {
                 add,
                 deleted_indexes,
-            }])
-            .await?;
+            }],
+        )
+        .await?;
         let snapshot = table.snapshot()?.snapshot().clone();
         let commit = CommitBuilder::default()
             .with_actions(actions)
@@ -288,7 +295,10 @@ mod tests {
         let table = make_table().await;
         let table = commit_dv(table, (0..10).collect()).await?;
         let data = get_data_sorted(&table, "value").await;
-        assert!(sorted_values(&data).is_empty(), "fully-masked file should read empty");
+        assert!(
+            sorted_values(&data).is_empty(),
+            "fully-masked file should read empty"
+        );
         Ok(())
     }
 
@@ -311,14 +321,19 @@ mod tests {
         assert_eq!(dv_files.len(), 1, "expected one DV file, got {dv_files:?}");
 
         // Full vacuum with zero retention — the aggressive case that lists the store.
-        let (table, result) =
-            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot().clone()))
-                .with_retention_period(chrono::Duration::hours(0))
-                .with_mode(VacuumMode::Full)
-                .with_enforce_retention_duration(false)
-                .await?;
+        let (table, result) = VacuumBuilder::new(
+            table.log_store(),
+            Some(table.snapshot()?.snapshot().clone()),
+        )
+        .with_retention_period(chrono::Duration::hours(0))
+        .with_mode(VacuumMode::Full)
+        .with_enforce_retention_duration(false)
+        .await?;
         assert!(
-            !result.files_deleted.iter().any(|f| f.contains("deletion_vector_")),
+            !result
+                .files_deleted
+                .iter()
+                .any(|f| f.contains("deletion_vector_")),
             "vacuum deleted a live DV file: {:?}",
             result.files_deleted
         );

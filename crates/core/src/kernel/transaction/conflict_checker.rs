@@ -364,6 +364,11 @@ pub(crate) struct ConflictChecker<'a> {
     winning_commit_summary: WinningCommitSummary,
     /// Isolation level for the current transaction
     isolation_level: IsolationLevel,
+    /// Opted-in via [`CommitBuilder::with_tolerate_concurrent_appends`]:
+    /// winning commits that only add data files never conflict — the caller
+    /// guarantees concurrently appended rows are not inputs to this commit.
+    /// Removed-file / protocol / metadata conflicts still abort.
+    tolerate_concurrent_appends: bool,
 }
 
 impl<'a> ConflictChecker<'a> {
@@ -409,7 +414,14 @@ impl<'a> ConflictChecker<'a> {
             txn_info: transaction_info,
             winning_commit_summary,
             isolation_level,
+            tolerate_concurrent_appends: false,
         }
+    }
+
+    /// See [`CommitBuilder::with_tolerate_concurrent_appends`].
+    pub fn with_tolerate_concurrent_appends(mut self, tolerate: bool) -> Self {
+        self.tolerate_concurrent_appends = tolerate;
+        self
     }
 
     /// This function checks conflict of the `initial_current_transaction_info` against the
@@ -482,6 +494,12 @@ impl<'a> ConflictChecker<'a> {
     ) -> Result<(), CommitConflictError> {
         // Skip check, if the operation can be downgraded to snapshot isolation
         if matches!(self.isolation_level, IsolationLevel::SnapshotIsolation) {
+            return Ok(());
+        }
+        // Explicit opt-in (see `with_tolerate_concurrent_appends`): concurrent
+        // appends are declared non-inputs, so only the removed-file /
+        // protocol / metadata checks below can conflict.
+        if self.tolerate_concurrent_appends {
             return Ok(());
         }
 
@@ -767,6 +785,31 @@ mod tests {
         checker.check_conflicts()
     }
 
+    /// `execute_test` with `with_tolerate_concurrent_appends(true)`.
+    async fn execute_tolerant_test(
+        setup: Option<Vec<Action>>,
+        reads: Option<Expr>,
+        concurrent: Vec<Action>,
+        actions: Vec<Action>,
+        read_whole_table: bool,
+    ) -> Result<(), CommitConflictError> {
+        use crate::table::state::DeltaTableState;
+
+        let setup_actions = setup.unwrap_or_else(init_table_actions);
+        let state = DeltaTableState::from_actions(setup_actions).await.unwrap();
+        let snapshot = state.snapshot();
+        let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
+        let transaction_info =
+            TransactionInfo::new(conflict_read_set, reads, &actions, read_whole_table);
+        let summary = WinningCommitSummary {
+            actions: concurrent,
+            commit_info: None,
+        };
+        let checker = ConflictChecker::new(transaction_info, summary, None)
+            .with_tolerate_concurrent_appends(true);
+        checker.check_conflicts()
+    }
+
     // A no-data-change OPTIMIZE (remove + re-add of `file_read` with
     // data_change=false) committing against the given concurrent actions.
     // Exercises the snapshot-isolation downgrade, which `execute_test` can't
@@ -921,6 +964,45 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(CommitConflictError::ConcurrentAppend)));
+    }
+
+    /// Append-tolerant commits rebase over concurrent adds that WOULD have
+    /// been read (the exact shape `test_concurrent_add_conflicts_with_read_and_write`
+    /// pins as a conflict), but a concurrently REMOVED read file must still
+    /// abort — the tolerance covers appends only.
+    #[tokio::test]
+    #[cfg(feature = "datafusion")]
+    async fn test_tolerated_concurrent_append_passes_but_delete_still_conflicts() {
+        let file_added = simple_add(true, "1", "10").into();
+        let file_should_have_read = simple_add(true, "1", "10").into();
+        let result = execute_tolerant_test(
+            None,
+            Some(col("value").lt_eq(lit::<i32>(10))),
+            vec![file_should_have_read],
+            vec![file_added],
+            false,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "tolerated concurrent append still conflicted: {result:?}"
+        );
+
+        let file_read = simple_add(true, "1", "10");
+        let mut setup_actions = init_table_actions();
+        setup_actions.push(file_read.clone().into());
+        let result = execute_tolerant_test(
+            Some(setup_actions),
+            Some(col("value").lt_eq(lit::<i32>(10))),
+            vec![ActionFactory::remove(&file_read, true).into()],
+            vec![],
+            false,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CommitConflictError::ConcurrentDeleteRead)),
+            "tolerance must not swallow removed-file conflicts: {result:?}"
+        );
     }
 
     #[tokio::test]

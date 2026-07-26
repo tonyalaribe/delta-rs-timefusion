@@ -697,21 +697,27 @@ pub(crate) async fn deletion_vector_delete(
     use datafusion::physical_plan::collect;
 
     use crate::kernel::Add;
-    use crate::operations::deletion_vectors::{write_deletion_vectors, FileDeletion};
+    use crate::operations::deletion_vectors::{FileDeletion, write_deletion_vectors};
 
-    let table = DeltaTable::new_with_state(log_store.clone(), DeltaTableState {
-        snapshot: snapshot.clone(),
-    });
+    let table = DeltaTable::new_with_state(
+        log_store.clone(),
+        DeltaTableState {
+            snapshot: snapshot.clone(),
+        },
+    );
 
     // Matched files, restricted to the authoritative valid set from the scan.
     let valid = Arc::new(files_scan.files_set());
     let root = Arc::new(snapshot.table_configuration().table_root().clone());
     let matched_adds: Vec<Add> = snapshot
         .snapshot()
-        .active_adds(log_store.as_ref(), ActiveAddOptions {
-            predicate: Some(files_scan.delta_predicate.clone()),
-            stats: AddStatsPolicy::RawJson,
-        })
+        .active_adds(
+            log_store.as_ref(),
+            ActiveAddOptions {
+                predicate: Some(files_scan.delta_predicate.clone()),
+                stats: AddStatsPolicy::RawJson,
+            },
+        )
         .try_filter_map(|f| {
             let (valid, root) = (Arc::clone(&valid), Arc::clone(&root));
             async move {
@@ -734,14 +740,11 @@ pub(crate) async fn deletion_vector_delete(
             .with_adds([add.clone()])
             .build()
             .await?;
-        let plan = LogicalPlanBuilder::scan(
-            "dv_scan",
-            provider_as_source(Arc::new(provider)),
-            None,
-        )?
-        .filter(files_scan.predicate.clone())?
-        .project([col(DV_ROW_INDEX_COL)])?
-        .build()?;
+        let plan =
+            LogicalPlanBuilder::scan("dv_scan", provider_as_source(Arc::new(provider)), None)?
+                .filter(files_scan.predicate.clone())?
+                .project([col(DV_ROW_INDEX_COL)])?
+                .build()?;
         let exec = session.create_physical_plan(&plan).await?;
         let batches = collect(exec, session.task_ctx()).await?;
 
@@ -751,13 +754,14 @@ pub(crate) async fn deletion_vector_delete(
                 .column(0)
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    DeltaTableError::Generic("row index column is not UInt64".into())
-                })?;
+                .ok_or_else(|| DeltaTableError::Generic("row index column is not UInt64".into()))?;
             // The scan exposes a 1-based row number; DV physical indexes are 0-based.
             deleted_indexes.extend(idx.iter().flatten().map(|v| v - 1));
         }
-        deletions.push(FileDeletion { add, deleted_indexes });
+        deletions.push(FileDeletion {
+            add,
+            deleted_indexes,
+        });
     }
 
     let num_deleted: usize = deletions.iter().map(|d| d.deleted_indexes.len()).sum();
@@ -982,7 +986,8 @@ mod tests {
 
         let schema = get_arrow_schema(&None);
         let table =
-            setup_table_with_configuration(TableProperty::EnableDeletionVectors, Some("true")).await;
+            setup_table_with_configuration(TableProperty::EnableDeletionVectors, Some("true"))
+                .await;
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),

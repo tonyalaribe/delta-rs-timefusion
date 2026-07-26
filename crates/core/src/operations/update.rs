@@ -367,7 +367,11 @@ async fn execute(
         // with a DV. Unmatched rows stay untouched in the original files.
         let updated_only = LogicalPlanBuilder::new(files_scan.scan().clone())
             .filter(files_scan.predicate.clone())?
-            .project(updated_row_expressions(&updates, files_scan.scan().schema(), safe_cast)?)?
+            .project(updated_row_expressions(
+                &updates,
+                files_scan.scan().schema(),
+                safe_cast,
+            )?)?
             .build()?;
         let physical_plan = session.create_physical_plan(&updated_only).await?;
         let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());

@@ -387,8 +387,13 @@ fn ceil_datetime(v: i64, ratio: i64) -> i64 {
 /// coerce it to `i64` (timestamp microseconds, or a raw long). Returns `None`
 /// for absent columns or non-numeric-temporal types.
 fn scalar_struct_field_i64(scalar: &Scalar, column: &str) -> Option<i64> {
-    let Scalar::Struct(sd) = scalar else { return None };
-    let idx = sd.fields().iter().position(|f| f.name().as_str() == column)?;
+    let Scalar::Struct(sd) = scalar else {
+        return None;
+    };
+    let idx = sd
+        .fields()
+        .iter()
+        .position(|f| f.name().as_str() == column)?;
     match sd.values().get(idx)? {
         #[cfg(feature = "nanosecond-timestamps")]
         Scalar::TimestampNanos(v) => Some(v / 1_000),

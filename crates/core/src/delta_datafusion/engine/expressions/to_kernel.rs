@@ -463,7 +463,11 @@ mod tests {
                 assert_eq!(j.op, JunctionPredicateOp::Or);
                 assert_eq!(j.preds.len(), n);
                 assert_string_equality_predicate(&j.preds[0], "span_id", "k0");
-                assert_string_equality_predicate(&j.preds[n - 1], "span_id", &format!("k{}", n - 1));
+                assert_string_equality_predicate(
+                    &j.preds[n - 1],
+                    "span_id",
+                    &format!("k{}", n - 1),
+                );
             }
             other => panic!("Expected OR junction, got {:?}", other),
         }
