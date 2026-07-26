@@ -768,6 +768,17 @@ mod tests {
         actions: Vec<Action>,
         read_whole_table: bool,
     ) -> Result<(), CommitConflictError> {
+        execute_test_opts(setup, reads, concurrent, actions, read_whole_table, false).await
+    }
+
+    async fn execute_test_opts(
+        setup: Option<Vec<Action>>,
+        reads: Option<Expr>,
+        concurrent: Vec<Action>,
+        actions: Vec<Action>,
+        read_whole_table: bool,
+        tolerate_concurrent_appends: bool,
+    ) -> Result<(), CommitConflictError> {
         use crate::table::state::DeltaTableState;
         use object_store::path::Path;
 
@@ -781,32 +792,8 @@ mod tests {
             actions: concurrent,
             commit_info: None,
         };
-        let checker = ConflictChecker::new(transaction_info, summary, None);
-        checker.check_conflicts()
-    }
-
-    /// `execute_test` with `with_tolerate_concurrent_appends(true)`.
-    async fn execute_tolerant_test(
-        setup: Option<Vec<Action>>,
-        reads: Option<Expr>,
-        concurrent: Vec<Action>,
-        actions: Vec<Action>,
-        read_whole_table: bool,
-    ) -> Result<(), CommitConflictError> {
-        use crate::table::state::DeltaTableState;
-
-        let setup_actions = setup.unwrap_or_else(init_table_actions);
-        let state = DeltaTableState::from_actions(setup_actions).await.unwrap();
-        let snapshot = state.snapshot();
-        let conflict_read_set = ConflictReadSet::from_log_data_for_test(snapshot.log_data());
-        let transaction_info =
-            TransactionInfo::new(conflict_read_set, reads, &actions, read_whole_table);
-        let summary = WinningCommitSummary {
-            actions: concurrent,
-            commit_info: None,
-        };
         let checker = ConflictChecker::new(transaction_info, summary, None)
-            .with_tolerate_concurrent_appends(true);
+            .with_tolerate_concurrent_appends(tolerate_concurrent_appends);
         checker.check_conflicts()
     }
 
@@ -975,12 +962,13 @@ mod tests {
     async fn test_tolerated_concurrent_append_passes_but_delete_still_conflicts() {
         let file_added = simple_add(true, "1", "10").into();
         let file_should_have_read = simple_add(true, "1", "10").into();
-        let result = execute_tolerant_test(
+        let result = execute_test_opts(
             None,
             Some(col("value").lt_eq(lit::<i32>(10))),
             vec![file_should_have_read],
             vec![file_added],
             false,
+            true,
         )
         .await;
         assert!(
@@ -991,12 +979,13 @@ mod tests {
         let file_read = simple_add(true, "1", "10");
         let mut setup_actions = init_table_actions();
         setup_actions.push(file_read.clone().into());
-        let result = execute_tolerant_test(
+        let result = execute_test_opts(
             Some(setup_actions),
             Some(col("value").lt_eq(lit::<i32>(10))),
             vec![ActionFactory::remove(&file_read, true).into()],
             vec![],
             false,
+            true,
         )
         .await;
         assert!(
