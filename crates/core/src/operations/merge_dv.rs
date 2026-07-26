@@ -14,10 +14,10 @@
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
-use datafusion::common::{exec_datafusion_err, ScalarValue};
-use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::common::{ScalarValue, exec_datafusion_err};
+use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{col, Expr, JoinType, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlanBuilder, col};
 use datafusion::physical_plan::collect;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -29,9 +29,9 @@ use crate::kernel::transaction::CommitBuilder;
 use crate::kernel::{Action, Add, EagerSnapshot};
 use crate::logstore::LogStoreRef;
 use crate::operations::delete::DV_ROW_INDEX_COL;
-use crate::operations::deletion_vectors::{write_deletion_vectors, FileDeletion};
-use crate::operations::write::execution::write_execution_plan;
+use crate::operations::deletion_vectors::{FileDeletion, write_deletion_vectors};
 use crate::operations::write::WriterStatsConfig;
+use crate::operations::write::execution::write_execution_plan;
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
@@ -58,6 +58,11 @@ pub struct MergeDvUpdate {
     pub target_alias: String,
     pub source_alias: String,
     pub writer_properties: Option<WriterProperties>,
+    /// Commit with [`CommitBuilder::with_tolerate_concurrent_appends`]: rebase
+    /// over concurrent AddFile-only commits instead of aborting. Sound only
+    /// when the writer guarantees rows appended after this merge's snapshot
+    /// already carry the merged values (TimeFusion mem-leg/flush contract).
+    pub tolerate_concurrent_appends: bool,
 }
 
 /// Execute a merge-on-read `UPDATE ... FROM`, committing DV masks + appended rows atomically.
@@ -88,9 +93,17 @@ pub async fn merge_update_with_deletion_vectors(
     let commit = CommitBuilder::default()
         .with_actions(actions)
         .with_operation_id(operation_id)
-        .build(Some(&snapshot), log_store.clone(), DeltaOperation::Update { predicate })
+        .with_tolerate_concurrent_appends(op.tolerate_concurrent_appends)
+        .build(
+            Some(&snapshot),
+            log_store.clone(),
+            DeltaOperation::Update { predicate },
+        )
         .await?;
-    Ok((DeltaTable::new_with_state(log_store, commit.snapshot()), num_updated))
+    Ok((
+        DeltaTable::new_with_state(log_store, commit.snapshot()),
+        num_updated,
+    ))
 }
 
 /// Cap on distinct key values pushed as an IN-filter: past this the planner cost
@@ -104,7 +117,11 @@ const KEY_PRUNE_MAX_VALUES: usize = 8192;
 /// rows the equi-join would reject anyway, and bloom filters never false-negative.
 /// Returns `None` (scan all) when a key column is missing, all-null, or the
 /// distinct set exceeds [`KEY_PRUNE_MAX_VALUES`].
-fn build_key_prune_filter(equi_keys: &[(String, String)], source_batches: &[RecordBatch], target_alias: &str) -> Option<Expr> {
+fn build_key_prune_filter(
+    equi_keys: &[(String, String)],
+    source_batches: &[RecordBatch],
+    target_alias: &str,
+) -> Option<Expr> {
     let mut acc: Option<Expr> = None;
     for (tgt, src) in equi_keys {
         let mut seen = std::collections::HashSet::new();
@@ -128,7 +145,11 @@ fn build_key_prune_filter(equi_keys: &[(String, String)], source_batches: &[Reco
         if list.is_empty() {
             return None;
         }
-        let in_list = Expr::InList(InList::new(Box::new(col(format!("{target_alias}.{tgt}"))), list, false));
+        let in_list = Expr::InList(InList::new(
+            Box::new(col(format!("{target_alias}.{tgt}"))),
+            list,
+            false,
+        ));
         acc = Some(match acc {
             None => in_list,
             Some(a) => a.and(in_list),
@@ -145,23 +166,31 @@ async fn collect_merge_dv_actions(
     operation_id: Uuid,
 ) -> DeltaResult<(Vec<Action>, u64)> {
     // Prune candidate files with the target-only predicate (partition + stats skipping).
-    let matched_adds = candidate_adds(log_store, snapshot, session, op.target_predicate.clone()).await?;
+    let matched_adds =
+        candidate_adds(log_store, snapshot, session, op.target_predicate.clone()).await?;
     if matched_adds.is_empty() {
         return Ok((vec![], 0));
     }
 
     // Scan-level key filter: bloom-prune files/row-groups holding no source key.
-    let key_prune_filter = build_key_prune_filter(&op.equi_keys, &op.source_batches, &op.target_alias);
+    let key_prune_filter =
+        build_key_prune_filter(&op.equi_keys, &op.source_batches, &op.target_alias);
 
-    let table = DeltaTable::new_with_state(log_store.clone(), DeltaTableState {
-        snapshot: snapshot.clone(),
-    });
+    let table = DeltaTable::new_with_state(
+        log_store.clone(),
+        DeltaTableState {
+            snapshot: snapshot.clone(),
+        },
+    );
     let partition_cols = snapshot.metadata().partition_columns().to_vec();
     let target_size = Some(snapshot.table_properties().target_file_size());
     let stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
     let target_schema = snapshot.arrow_schema();
 
-    let source = Arc::new(MemTable::try_new(op.source_schema.clone(), vec![op.source_batches.clone()])?);
+    let source = Arc::new(MemTable::try_new(
+        op.source_schema.clone(),
+        vec![op.source_batches.clone()],
+    )?);
 
     let mut actions = Vec::new();
     let mut deletions = Vec::new();
@@ -217,8 +246,12 @@ async fn collect_merge_dv_actions(
 
         // Append the updated rows as new files (no DV; data_change).
         if !updated_batches.is_empty() {
-            let mem = Arc::new(MemTable::try_new(target_schema.clone(), vec![updated_batches])?);
-            let append_plan = LogicalPlanBuilder::scan("updated", provider_as_source(mem), None)?.build()?;
+            let mem = Arc::new(MemTable::try_new(
+                target_schema.clone(),
+                vec![updated_batches],
+            )?);
+            let append_plan =
+                LogicalPlanBuilder::scan("updated", provider_as_source(mem), None)?.build()?;
             let append_exec = session.create_physical_plan(&append_plan).await?;
             let mut appended = write_execution_plan(
                 Some(snapshot),
@@ -235,7 +268,10 @@ async fn collect_merge_dv_actions(
             actions.append(&mut appended);
         }
 
-        deletions.push(FileDeletion { add, deleted_indexes: indexes });
+        deletions.push(FileDeletion {
+            add,
+            deleted_indexes: indexes,
+        });
     }
 
     let root = snapshot.table_configuration().table_root().clone();
@@ -265,8 +301,13 @@ async fn candidate_adds(
                 .await;
         }
     };
-    let Some(files_scan) =
-        crate::delta_datafusion::scan_files_where_matches(session, snapshot, log_store.clone(), predicate).await?
+    let Some(files_scan) = crate::delta_datafusion::scan_files_where_matches(
+        session,
+        snapshot,
+        log_store.clone(),
+        predicate,
+    )
+    .await?
     else {
         return Ok(vec![]);
     };
@@ -274,14 +315,19 @@ async fn candidate_adds(
     let root = Arc::new(snapshot.table_configuration().table_root().clone());
     snapshot
         .snapshot()
-        .active_adds(log_store.as_ref(), crate::kernel::ActiveAddOptions {
-            predicate: Some(files_scan.delta_predicate.clone()),
-            stats: crate::kernel::AddStatsPolicy::RawJson,
-        })
+        .active_adds(
+            log_store.as_ref(),
+            crate::kernel::ActiveAddOptions {
+                predicate: Some(files_scan.delta_predicate.clone()),
+                stats: crate::kernel::AddStatsPolicy::RawJson,
+            },
+        )
         .try_filter_map(|f| {
             let (valid, root) = (Arc::clone(&valid), Arc::clone(&root));
             async move {
-                let url = root.join(f.path_raw()).map_err(|e| exec_datafusion_err!("{e}"))?;
+                let url = root
+                    .join(f.path_raw())
+                    .map_err(|e| exec_datafusion_err!("{e}"))?;
                 Ok(valid.contains(url.as_ref()).then(|| f.to_add()))
             }
         })
@@ -367,10 +413,13 @@ mod tests {
             Field::new("id", DataType::Utf8, true),
             Field::new("value", DataType::Int32, true),
         ]));
-        RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
         .unwrap()
     }
 
@@ -379,10 +428,13 @@ mod tests {
             Field::new("sid", DataType::Utf8, true),
             Field::new("newval", DataType::Int32, true),
         ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(StringArray::from(vec!["b", "c"])),
-            Arc::new(Int32Array::from(vec![20, 30])),
-        ])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["b", "c"])),
+                Arc::new(Int32Array::from(vec![20, 30])),
+            ],
+        )
         .unwrap();
         (vec![batch], schema)
     }
@@ -391,7 +443,9 @@ mod tests {
     fn key_prune_filter_builds_in_list_and_bails_gracefully() {
         let (batches, _) = source_batch();
         // Distinct source key values become `target.id IN (...)`.
-        let f = build_key_prune_filter(&[("id".to_string(), "sid".to_string())], &batches, "target").expect("filter");
+        let f =
+            build_key_prune_filter(&[("id".to_string(), "sid".to_string())], &batches, "target")
+                .expect("filter");
         match f {
             Expr::InList(il) => {
                 assert_eq!(il.list.len(), 2, "one InList entry per distinct source key");
@@ -401,7 +455,14 @@ mod tests {
         }
         // No equi-keys, or a key column absent from the source → no filter (scan all).
         assert!(build_key_prune_filter(&[], &batches, "target").is_none());
-        assert!(build_key_prune_filter(&[("id".to_string(), "missing".to_string())], &batches, "target").is_none());
+        assert!(
+            build_key_prune_filter(
+                &[("id".to_string(), "missing".to_string())],
+                &batches,
+                "target"
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -418,24 +479,33 @@ mod tests {
             .with_configuration_property(TableProperty::EnableDeletionVectors, Some("true"))
             .await
             .unwrap();
-        let table = table.write(vec![target_batch()]).with_save_mode(SaveMode::Append).await.unwrap();
+        let table = table
+            .write(vec![target_batch()])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
         assert_eq!(table.snapshot()?.log_data().num_files(), 1);
 
         let session = create_session().into_inner().state();
         table.update_datafusion_session(&session)?;
         let (source_batches, source_schema) = source_batch();
 
-        let (table, updated) = merge_update_with_deletion_vectors(&table, &session, MergeDvUpdate {
-            source_batches,
-            source_schema,
-            target_predicate: None,
-            join_predicate: col("target.id").eq(col("source.sid")),
-            equi_keys: vec![],
-            updates: vec![("value".to_string(), col("source.newval"))],
-            target_alias: "target".to_string(),
-            source_alias: "source".to_string(),
-            writer_properties: None,
-        })
+        let (table, updated) = merge_update_with_deletion_vectors(
+            &table,
+            &session,
+            MergeDvUpdate {
+                source_batches,
+                source_schema,
+                target_predicate: None,
+                join_predicate: col("target.id").eq(col("source.sid")),
+                equi_keys: vec![],
+                updates: vec![("value".to_string(), col("source.newval"))],
+                target_alias: "target".to_string(),
+                source_alias: "source".to_string(),
+                writer_properties: None,
+                tolerate_concurrent_appends: false,
+            },
+        )
         .await?;
 
         assert_eq!(updated, 2, "two target rows matched");
@@ -454,11 +524,14 @@ mod tests {
             }
         }
         pairs.sort();
-        assert_eq!(pairs, vec![
-            ("a".to_string(), 1),
-            ("b".to_string(), 20),
-            ("c".to_string(), 30),
-        ]);
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), 1),
+                ("b".to_string(), 20),
+                ("c".to_string(), 30),
+            ]
+        );
         Ok(())
     }
 }
