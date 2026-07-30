@@ -897,6 +897,7 @@ async fn test_optimize_selected_file_scans_register_operation_scoped_log_store()
         &[],
         None,
         Some(NonZeroU64::new(1_000_000).unwrap()),
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )

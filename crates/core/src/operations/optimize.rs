@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -321,6 +321,10 @@ pub struct OptimizeBuilder<'a> {
     selected_files_binned: bool,
     /// Desired file size after bin-packing files
     target_size: Option<NonZeroU64>,
+    /// Cap on files per merge bin: bounds a rewrite's merge fan-in /
+    /// blocking-sort input on fragmented partitions (memory otherwise scales
+    /// with fragmentation). `None` keeps byte-only binning.
+    max_files_per_bin: Option<NonZeroUsize>,
     /// Properties passed to underlying parquet writer
     writer_properties: Option<WriterProperties>,
     /// Commit properties and configuration
@@ -355,6 +359,7 @@ impl<'a> OptimizeBuilder<'a> {
             selected_files: None,
             selected_files_binned: false,
             target_size: None,
+            max_files_per_bin: None,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
             max_concurrent_tasks: num_cpus::get(),
@@ -398,6 +403,12 @@ impl<'a> OptimizeBuilder<'a> {
     /// Set the target file size
     pub fn with_target_size(mut self, target: NonZeroU64) -> Self {
         self.target_size = Some(target);
+        self
+    }
+
+    /// Cap the number of files packed into one merge bin (see field doc).
+    pub fn with_max_files_per_bin(mut self, max_files: NonZeroUsize) -> Self {
+        self.max_files_per_bin = Some(max_files);
         self
     }
 
@@ -505,6 +516,7 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                 this.selected_files.as_deref(),
                 this.selected_files_binned,
                 this.target_size.to_owned(),
+                this.max_files_per_bin,
                 writer_properties,
                 session,
             )
@@ -1300,6 +1312,7 @@ pub async fn create_merge_plan(
     filters: &[PartitionFilter],
     selected_files: Option<&[String]>,
     target_size: Option<NonZeroU64>,
+    max_files_per_bin: Option<NonZeroUsize>,
     writer_properties: WriterProperties,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
@@ -1311,6 +1324,7 @@ pub async fn create_merge_plan(
         selected_files,
         false,
         target_size,
+        max_files_per_bin,
         writer_properties,
         session,
     )
@@ -1325,6 +1339,7 @@ async fn create_merge_plan_with_binned_files(
     selected_files: Option<&[String]>,
     selected_files_binned: bool,
     target_size: Option<NonZeroU64>,
+    max_files_per_bin: Option<NonZeroUsize>,
     writer_properties: WriterProperties,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
@@ -1339,7 +1354,7 @@ async fn create_merge_plan_with_binned_files(
     let (operations, metrics, planner_stats) = match optimize_type {
         OptimizeType::Compact => {
             info!("building compaction plan");
-            build_compaction_plan(log_store, snapshot, filters, target_size).await?
+            build_compaction_plan(log_store, snapshot, filters, target_size, max_files_per_bin).await?
         }
         OptimizeType::ZOrder(zorder_columns) => {
             info!("building z-order plan");
@@ -1364,6 +1379,7 @@ async fn create_merge_plan_with_binned_files(
                 selected_files,
                 selected_files_binned,
                 target_size,
+                max_files_per_bin,
             )
             .await?
         }
@@ -1379,6 +1395,7 @@ async fn create_merge_plan_with_binned_files(
                 selected_files,
                 selected_files_binned,
                 target_size,
+                max_files_per_bin,
             )
             .await?
         }
@@ -1482,7 +1499,14 @@ struct OrderedFileCandidate {
 fn plan_compaction_bins_in_stable_order(
     files: Vec<OrderedFileCandidate>,
     target_size: u64,
+    max_files_per_bin: Option<NonZeroUsize>,
 ) -> (Vec<MergeBin>, PlannerStats) {
+    // Byte-bounded bins have unbounded file counts: a fragmented partition
+    // (hundreds of tiny files) packs into one bin, and the rewrite's merge
+    // fan-in / blocking-sort input scales with that count — memory demand
+    // peaks exactly when compaction is most needed. The count cap bounds it;
+    // repeated passes still converge to target_size.
+    let max_files = max_files_per_bin.map_or(usize::MAX, NonZeroUsize::get);
     let mut bins = Vec::new();
     let mut current = MergeBin::new();
     let mut current_first_ordinal = None;
@@ -1513,7 +1537,7 @@ fn plan_compaction_bins_in_stable_order(
             continue;
         }
 
-        if current.total_file_size() + file.size_bytes <= target_size {
+        if current.len() < max_files && current.total_file_size() + file.size_bytes <= target_size {
             current.add(file.add);
             current_last_ordinal = Some(file.stable_ordinal);
             continue;
@@ -1583,6 +1607,7 @@ async fn build_compaction_plan(
     snapshot: &EagerSnapshot,
     filters: &[PartitionFilter],
     target_size: NonZeroU64,
+    max_files_per_bin: Option<NonZeroUsize>,
 ) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
     type PartitionFileEntry = (IndexMap<String, Scalar>, usize, Vec<OrderedFileCandidate>);
 
@@ -1630,7 +1655,7 @@ async fn build_compaction_plan(
     let mut operations: HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)> = HashMap::new();
     for (part, (partition, _, files)) in partition_files {
         let (merge_bins, partition_stats) =
-            plan_compaction_bins_in_stable_order(files, target_size.get());
+            plan_compaction_bins_in_stable_order(files, target_size.get(), max_files_per_bin);
         planner_stats.absorb(&partition_stats);
 
         operations.insert(part, (partition, merge_bins));
@@ -1770,6 +1795,7 @@ async fn build_sort_plan(
     selected_files: Option<&[String]>,
     selected_files_binned: bool,
     target_size: NonZeroU64,
+    max_files_per_bin: Option<NonZeroUsize>,
 ) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
     if sort_columns.is_empty() {
         return Err(DeltaTableError::Generic(
@@ -1859,7 +1885,7 @@ async fn build_sort_plan(
             }
             (vec![bin], PlannerStats::preserve_locality())
         } else {
-            plan_compaction_bins_in_stable_order(files, target_size.get())
+            plan_compaction_bins_in_stable_order(files, target_size.get(), max_files_per_bin)
         };
         planner_stats.absorb(&partition_stats);
         operations.insert(part, (partition, merge_bins));
@@ -1921,6 +1947,24 @@ mod compact_planner_tests {
     }
 
     #[test]
+    fn test_bins_capped_by_max_files_per_bin() {
+        // 100 tiny files fit one byte-bounded bin; the count cap must split
+        // them so merge fan-in (and blocking-sort input) stays bounded.
+        let files = (0..100).map(|i| candidate(i, 1)).collect_vec();
+        let (bins, _) =
+            plan_compaction_bins_in_stable_order(files, 1_000_000, NonZeroUsize::new(16));
+        assert_eq!(bins.len(), 7); // ceil(100/16)
+        assert!(bins.iter().all(|b| b.len() <= 16));
+        // Contiguity preserved: still stable-ordered, adjacent ordinals.
+        let planned = bins.iter().map(ordinals).collect::<Vec<_>>();
+        assert!(
+            planned
+                .iter()
+                .all(|bin| bin.windows(2).all(|w| w[1] == w[0] + 1))
+        );
+    }
+
+    #[test]
     fn test_ordered_compact_bins_are_contiguous() {
         let (bins, stats) = plan_compaction_bins_in_stable_order(
             vec![
@@ -1930,6 +1974,7 @@ mod compact_planner_tests {
                 candidate(3, 3),
             ],
             10,
+            None,
         );
 
         let planned_ordinals = bins.iter().map(ordinals).collect::<Vec<_>>();
@@ -1948,6 +1993,7 @@ mod compact_planner_tests {
                 candidate(3, 2),
             ],
             10,
+            None,
         );
 
         let planned_ordinals = bins.iter().map(ordinals).collect::<Vec<_>>();
@@ -1963,7 +2009,7 @@ mod compact_planner_tests {
     #[test]
     fn test_ordered_compact_bins_respect_ordinal_gaps() {
         let (bins, stats) =
-            plan_compaction_bins_in_stable_order(vec![candidate(0, 3), candidate(2, 3)], 10);
+            plan_compaction_bins_in_stable_order(vec![candidate(0, 3), candidate(2, 3)], 10, None);
 
         let planned_ordinals = bins.iter().map(ordinals).collect::<Vec<_>>();
 
@@ -1981,6 +2027,7 @@ mod compact_planner_tests {
                 candidate(3, 9),
             ],
             10,
+            None,
         );
 
         assert_eq!(stats.planner_strategy, PlannerStrategy::PreserveLocality);
