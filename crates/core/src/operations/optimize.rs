@@ -1068,7 +1068,7 @@ impl MergePlan {
                             scan_factory.clone(),
                         );
 
-                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                        let rewrite_result = util::spawn_abort_on_drop(Self::rewrite_files(
                             task_parameters.clone(),
                             partition,
                             files,
@@ -1107,7 +1107,7 @@ impl MergePlan {
                             exec_context.clone(),
                             scan_factory.clone(),
                         );
-                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                        let rewrite_result = util::spawn_abort_on_drop(Self::rewrite_files(
                             task_parameters.clone(),
                             partition,
                             files,
@@ -1147,7 +1147,7 @@ impl MergePlan {
                             scan_factory.clone(),
                             sort_columns.clone(),
                         );
-                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                        let rewrite_result = util::spawn_abort_on_drop(Self::rewrite_files(
                             task_parameters.clone(),
                             partition,
                             files,
@@ -1200,7 +1200,7 @@ impl MergePlan {
                         let columns = dedup_columns.clone();
                         let batch_stream =
                             async move { Ok(Self::dedup_sorted(read.await?, columns)) };
-                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                        let rewrite_result = util::spawn_abort_on_drop(Self::rewrite_files(
                             task_parameters.clone(),
                             partition,
                             files,
@@ -2052,6 +2052,38 @@ pub(super) mod util {
     use super::*;
     use futures::Future;
     use tokio::task::JoinError;
+
+    /// Spawn `fut`, aborting it if the returned future is dropped. A failed
+    /// optimize attempt drops its bin stream mid-flight; a bare JoinHandle
+    /// would DETACH the in-flight rewrite task — leaving it running in the
+    /// background, holding sort/merge reservations on the caller's (shared,
+    /// long-lived) memory pool and writing orphan files — while the caller
+    /// retries against that same pool. A few transient-S3 retries then
+    /// exhaust the pool ("x MB remain available" with nothing visibly
+    /// running).
+    pub fn spawn_abort_on_drop<T: Send + 'static>(
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> AbortOnDrop<T> {
+        AbortOnDrop(tokio::task::spawn(fut))
+    }
+
+    pub struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    impl<T> Future for AbortOnDrop<T> {
+        type Output = Result<T, JoinError>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::pin::Pin::new(&mut self.0).poll(cx)
+        }
+    }
 
     pub async fn flatten_join_error<T, E>(
         future: impl Future<Output = Result<Result<T, E>, JoinError>>,
