@@ -802,7 +802,25 @@ impl MergePlan {
 
         let mut read_stream = read_stream.await?;
 
-        while let Some(maybe_batch) = read_stream.next().await {
+        // A batch that never arrives is an immortal 0%-CPU rewrite: a failed
+        // sort/scan sub-task can die without closing its output channel, and
+        // this `.next()` then awaits forever (prod wedges 2026-07-30, up to
+        // 6 h; one pre-timeout container idled 5 weeks). 20 min per batch
+        // bounds even the one-time blocking sort of a legacy bin; on expiry
+        // the bin fails like any other error and the caller's retry ladder
+        // (attempt loop / ratchet / cron) takes over.
+        const READ_BATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+        loop {
+            let maybe_batch = match tokio::time::timeout(READ_BATCH_IDLE_TIMEOUT, read_stream.next()).await {
+                Ok(Some(b)) => b,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(DeltaTableError::Generic(format!(
+                        "optimize rewrite: no batch for {}s — upstream sort/scan wedged; failing the bin for retry",
+                        READ_BATCH_IDLE_TIMEOUT.as_secs()
+                    )));
+                }
+            };
             let mut batch = maybe_batch?;
 
             batch = crate::kernel::schema::cast::cast_record_batch(
