@@ -58,6 +58,19 @@ pub struct MergeDvUpdate {
     pub target_alias: String,
     pub source_alias: String,
     pub writer_properties: Option<WriterProperties>,
+    /// Sort the APPENDED rows by these `(column, descending, nulls_first)` keys
+    /// before writing them.
+    ///
+    /// Without it the appended file inherits the join's row order, so its
+    /// parquet footer cannot honestly declare `sorting_columns` — and a reader
+    /// that derives a scan-wide ordering from footers (all-or-nothing) loses it
+    /// for the WHOLE partition the moment one such file lands. On a
+    /// continuously-enriched table that is every partition, permanently: the
+    /// top-N ordering pushdown never fires. Sorting here is cheap — the appended
+    /// set is the matched rows, not the table — and it is what lets the caller
+    /// pass writer properties that declare the footer truthfully. Empty = no
+    /// sort (previous behaviour).
+    pub append_sort_by: Vec<(String, bool, bool)>,
     /// Commit with [`CommitBuilder::with_tolerate_concurrent_appends`]: rebase
     /// over concurrent AddFile-only commits instead of aborting. Sound only
     /// when the writer guarantees rows appended after this merge's snapshot
@@ -250,8 +263,18 @@ async fn collect_merge_dv_actions(
                 target_schema.clone(),
                 vec![updated_batches],
             )?);
-            let append_plan =
-                LogicalPlanBuilder::scan("updated", provider_as_source(mem), None)?.build()?;
+            let mut append_builder =
+                LogicalPlanBuilder::scan("updated", provider_as_source(mem), None)?;
+            let sort_exprs: Vec<_> = op
+                .append_sort_by
+                .iter()
+                .filter(|(name, _, _)| target_schema.index_of(name).is_ok())
+                .map(|(name, descending, nulls_first)| col(name).sort(!*descending, *nulls_first))
+                .collect();
+            if !sort_exprs.is_empty() {
+                append_builder = append_builder.sort(sort_exprs)?;
+            }
+            let append_plan = append_builder.build()?;
             let append_exec = session.create_physical_plan(&append_plan).await?;
             let mut appended = write_execution_plan(
                 Some(snapshot),
@@ -503,6 +526,7 @@ mod tests {
                 target_alias: "target".to_string(),
                 source_alias: "source".to_string(),
                 writer_properties: None,
+            append_sort_by: vec![],
                 tolerate_concurrent_appends: false,
             },
         )
