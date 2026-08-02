@@ -363,6 +363,17 @@ impl Snapshot {
             materialized_files: None,
         });
 
+        // `scan_metadata_from` silently DISCARDS the existing-data hint and
+        // returns the FULL active file set when the rebuilt log segment is
+        // anchored on a checkpoint newer than the hint version (it cannot
+        // replay commits the checkpoint already folded in). Concatenating that
+        // onto `batches` below would count every carried file twice, so take
+        // the full update instead — the carried list buys nothing here anyway,
+        // since the checkpoint is exactly the materialization we'd be redoing.
+        if matches!(advanced.checkpoint_version(), Some(v) if v > current_version) {
+            return self.update(engine, Some(target_version)).await;
+        }
+
         // Scan only the files added since `current_version` (empty existing
         // data ⇒ the kernel emits just the delta), in the same FullPreserveRaw
         // schema as the carried-forward batches.
@@ -2881,6 +2892,71 @@ mod tests {
             paths(&fast3).await?,
             paths(&full3).await?,
             "remove-bearing catch-up must match full update"
+        );
+        Ok(())
+    }
+
+    /// A checkpoint written inside the catch-up range must not duplicate the
+    /// file list. The kernel's `scan_metadata_from` silently DISCARDS the
+    /// existing-data hint and returns the FULL active file set whenever the
+    /// rebuilt log segment is anchored on a checkpoint newer than the hint
+    /// version — so concatenating it onto the carried-forward list counted every
+    /// file twice. In production (checkpoint after every compaction wave) that
+    /// doubled the in-memory file set on the first refresh across each
+    /// checkpoint: reads double-counted rows and file→Add mapping broke
+    /// ("mapped 2/1 files", dedup and hot-tail compaction stalled permanently).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn advance_catchup_across_a_checkpoint_does_not_duplicate_files() -> TestResult {
+        use crate::writer::test_utils::{
+            create_initialized_table, datafusion::write_batch, get_record_batch,
+        };
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_str().unwrap();
+        let table = create_initialized_table(path, &[]).await; // v0
+        let table = write_batch(table, get_record_batch(None, false)).await; // v1
+        let table = write_batch(table, get_record_batch(None, false)).await; // v2
+        // Checkpoint at v2 — newer than the v1 hint the catch-up carries forward.
+        crate::protocol::checkpoints::create_checkpoint(&table, None).await?;
+        let table = write_batch(table, get_record_batch(None, false)).await; // v3
+        let log_store = table.log_store();
+        let target = table.version().unwrap();
+
+        let mut fast =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        assert!(
+            fast.advance_catchup(log_store.as_ref(), 64).await?,
+            "range must take the catch-up path"
+        );
+        assert_eq!(fast.version(), target);
+        let mut full =
+            EagerSnapshot::try_new(log_store.as_ref(), Default::default(), Some(1)).await?;
+        full.update(log_store.as_ref(), Some(target)).await?;
+
+        let paths = |s: &EagerSnapshot| {
+            let ls = log_store.clone();
+            let s = s.clone();
+            async move {
+                let mut p: Vec<String> = s
+                    .file_views(ls.as_ref(), None)
+                    .map_ok(|f| f.path_raw().to_string())
+                    .try_collect()
+                    .await?;
+                p.sort();
+                Ok::<_, DeltaTableError>(p)
+            }
+        };
+        let fast_paths = paths(&fast).await?;
+        let mut distinct = fast_paths.clone();
+        distinct.dedup();
+        assert_eq!(
+            distinct, fast_paths,
+            "catch-up across a checkpoint must not list any file twice"
+        );
+        assert_eq!(
+            fast_paths,
+            paths(&full).await?,
+            "catch-up across a checkpoint must match full update"
         );
         Ok(())
     }
