@@ -776,7 +776,7 @@ async fn get_read_plan(
         // so a footer-derived ordering never over-claims. Loading the footers here is cache-
         // backed (same metadata cache the reader uses), so it front-loads reads the scan does
         // anyway rather than adding net IO.
-        let output_ordering = derive_common_ordering(
+        let derived_ordering = derive_common_ordering(
             object_store.clone(),
             metadata_cache.clone(),
             &files,
@@ -786,20 +786,22 @@ async fn get_read_plan(
 
         // A declared ordering only survives DataFusion's stats-based per-group validation
         // (`FileScanConfig::validated_output_ordering`) if every file carries min/max stats
-        // for every sort column. Backfill those from the parquet footers (cache-warm after
-        // `derive_common_ordering`); if any file cannot be enriched, drop the claim rather
-        // than declare an ordering that dies silently — or worse, guess.
-        let output_ordering = match output_ordering {
-            Some(ordering) => enrich_sort_column_stats(
-                object_store.clone(),
-                metadata_cache.clone(),
-                &mut files,
-                &ordering,
-                parquet_read_schema.clone(),
-            )
-            .await
-            .then_some(ordering),
-            None => None,
+        // for every sort column, and Delta add-file stats only cover predicate columns. Merge
+        // the sort-column stats `derive_common_ordering` extracted from the footers it
+        // already fetched (no plan-time IO here), then declare only the longest sort prefix
+        // every file has stats for — a prefix claim is still sound (each file is sorted by
+        // the full key, hence by any prefix) and is what TopK / bounded dedup need.
+        // `regroup` is false when not even the lead column is stats-backed: declare the full
+        // ordering over the untouched grouping and let validation decide, exactly as before.
+        let (output_ordering, regroup) = match derived_ordering {
+            Some((ordering, footer_stats)) => {
+                apply_footer_sort_stats(&mut files, footer_stats, parquet_read_schema);
+                match stats_backed_prefix_len(&files, &ordering) {
+                    0 => (Some(ordering), false),
+                    len => (LexOrdering::new(ordering.iter().take(len).cloned()), true),
+                }
+            }
+            None => (None, false),
         };
 
         if let Some(selections) = row_ordinal_selections
@@ -820,10 +822,10 @@ async fn get_read_plan(
         // key). Repack so the declared ordering survives; without a declared ordering keep
         // the grouping exactly as-is.
         let file_groups = match &output_ordering {
-            Some(ordering) => {
+            Some(ordering) if regroup => {
                 regroup_for_declared_ordering(file_groups, ordering, &full_table_schema)
             }
-            None => file_groups,
+            _ => file_groups,
         };
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
@@ -849,16 +851,26 @@ async fn get_read_plan(
     })
 }
 
+/// Per-file sort-column footer stats: `(column index, (min, max, null_count))` for every
+/// column of the file's declared footer ordering; `None` when some stat is unavailable.
+type FooterSortStats = Option<Vec<(usize, (ScalarValue, ScalarValue, usize))>>;
+
 /// Returns a scan-wide [`LexOrdering`] iff **every** file declares the **same** non-empty
 /// parquet `sorting_columns` footer, else `None`. The conservative all-or-nothing rule keeps
 /// the advertised ordering honest for the union of files: a single unsorted file (e.g. a
 /// Z-ordered/compacted file, which declares no ordering) disables the claim for the scan.
+///
+/// Alongside the ordering, returns each file's sort-column min/max/null-count extracted from
+/// the **same** footers (indexed like `files`) — the ordering only survives DataFusion's
+/// stats-based validation when per-file stats back it, and pulling them out here keeps all
+/// footer reads in this one bounded, cache-backed pass (no further plan-time IO).
 async fn derive_common_ordering(
     store: Arc<dyn ObjectStore>,
     cache: Arc<dyn FileMetadataCache>,
     files: &[(PartitionedFile, Option<Vec<bool>>)],
     read_schema: SchemaRef,
-) -> Option<LexOrdering> {
+) -> Option<(LexOrdering, Vec<FooterSortStats>)> {
+    use datafusion::physical_expr::expressions::Column;
     // Fetch footers concurrently (bounded). On a cold metadata cache a scan can span hundreds
     // of files; a serial loop would add that many sequential footer reads to *planning*. The
     // cache is shared with the reader, so these reads also warm execution. The per-file futures
@@ -868,26 +880,49 @@ async fn derive_common_ordering(
     // takes an owned value — a closure over a borrowed scan item is not lifetime-general and
     // makes the whole scan future fail HRTB inference.
     let object_metas: Vec<ObjectMeta> = files.iter().map(|(f, _)| f.object_meta.clone()).collect();
-    let fetches = object_metas.into_iter().map(|object_meta| {
-        let (store, cache, read_schema) = (store.clone(), cache.clone(), read_schema.clone());
-        async move {
-            let meta = DFParquetMetadata::new(store.as_ref(), &object_meta)
-                .with_file_metadata_cache(Some(cache))
-                .fetch_metadata()
-                .await
-                .ok()?;
-            ordering_from_parquet_metadata(&meta, &read_schema)
-                .ok()
-                .flatten()
-        }
-    });
-    let orderings: Vec<Option<LexOrdering>> = futures::stream::iter(fetches)
-        .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
-        .collect()
-        .await;
+    let file_count = object_metas.len();
+    let fetches = object_metas
+        .into_iter()
+        .enumerate()
+        .map(|(idx, object_meta)| {
+            let (store, cache, read_schema) = (store.clone(), cache.clone(), read_schema.clone());
+            async move {
+                let meta = DFParquetMetadata::new(store.as_ref(), &object_meta)
+                    .with_file_metadata_cache(Some(cache))
+                    .fetch_metadata()
+                    .await
+                    .ok();
+                let ordering = meta.as_ref().and_then(|meta| {
+                    ordering_from_parquet_metadata(meta, &read_schema)
+                        .ok()
+                        .flatten()
+                });
+                let stats: FooterSortStats =
+                    ordering
+                        .as_ref()
+                        .zip(meta.as_ref())
+                        .and_then(|(ordering, meta)| {
+                            ordering
+                                .iter()
+                                .map(|expr| {
+                                    let column = expr.expr.downcast_ref::<Column>()?.index();
+                                    sort_column_footer_stats(meta, &read_schema, column)
+                                        .map(|stats| (column, stats))
+                                })
+                                .collect()
+                        });
+                (idx, ordering, stats)
+            }
+        });
+    let results: Vec<(usize, Option<LexOrdering>, FooterSortStats)> =
+        futures::stream::iter(fetches)
+            .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
+            .collect()
+            .await;
 
     let mut common: Option<LexOrdering> = None;
-    for ordering in orderings {
+    let mut footer_stats: Vec<FooterSortStats> = vec![None; file_count];
+    for (idx, ordering, stats) in results {
         // Any missing footer or fetch error disables the claim for the whole scan.
         let ordering = ordering?;
         match &common {
@@ -895,8 +930,9 @@ async fn derive_common_ordering(
             Some(existing) if *existing != ordering => return None,
             _ => {}
         }
+        footer_stats[idx] = stats;
     }
-    common
+    common.map(|ordering| (ordering, footer_stats))
 }
 
 /// Upper bound on file groups produced when repacking for a declared ordering. Heavily
@@ -954,90 +990,32 @@ fn regroup_for_declared_ordering(
     }
 }
 
-/// Backfill per-file min/max (and null-count) statistics for `ordering`'s sort columns from
-/// the parquet footers wherever the Delta add-file stats don't already provide them.
+/// Merge footer-derived sort-column stats into each file's DataFusion statistics, filling
+/// gaps only — Delta add-file stats, when present, stay authoritative. Purely in-memory: the
+/// footers were already read by [`derive_common_ordering`], this does no IO.
 ///
 /// DataFusion validates a declared output ordering against per-file min/max statistics, but
 /// Delta stats are only materialized for predicate columns, so sort columns (e.g. a tiebreak
 /// id) are typically `Absent` and every multi-file group would fail validation. Footer
-/// row-group stats are ground truth for exactly these files and were just cached by
-/// [`derive_common_ordering`]'s fetches. Returns `false` when any file could not be enriched
-/// (missing footer stat, non-column sort expression) — the caller must then drop the
-/// ordering claim rather than guess.
-async fn enrich_sort_column_stats(
-    store: Arc<dyn ObjectStore>,
-    cache: Arc<dyn FileMetadataCache>,
+/// min/max may be truncated bounds (strings), hence `Inexact` — still a valid bound for the
+/// non-overlap check.
+fn apply_footer_sort_stats(
     files: &mut [(PartitionedFile, Option<Vec<bool>>)],
-    ordering: &LexOrdering,
-    read_schema: SchemaRef,
-) -> bool {
-    use datafusion::physical_expr::expressions::Column;
-    let Some(sort_columns) = ordering
-        .iter()
-        .map(|expr| {
-            expr.expr
-                .downcast_ref::<Column>()
-                .map(|column| column.index())
-        })
-        .collect::<Option<Vec<usize>>>()
-    else {
-        return false;
-    };
-
-    const FOOTER_FETCH_CONCURRENCY: usize = 16;
-    // Per-file futures own everything they touch (see `derive_common_ordering`).
-    let object_metas: Vec<ObjectMeta> = files.iter().map(|(f, _)| f.object_meta.clone()).collect();
-    let fetches = object_metas
-        .into_iter()
-        .enumerate()
-        .map(|(idx, object_meta)| {
-            let (store, cache, read_schema, sort_columns) = (
-                store.clone(),
-                cache.clone(),
-                read_schema.clone(),
-                sort_columns.clone(),
-            );
-            async move {
-                let meta = DFParquetMetadata::new(store.as_ref(), &object_meta)
-                    .with_file_metadata_cache(Some(cache))
-                    .fetch_metadata()
-                    .await
-                    .ok()?;
-                sort_columns
-                    .iter()
-                    .map(|&column| {
-                        sort_column_footer_stats(&meta, &read_schema, column)
-                            .map(|stats| (column, stats))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .map(|per_column| (idx, per_column))
-            }
-        });
-    let results: Vec<Option<(usize, Vec<(usize, (ScalarValue, ScalarValue, usize))>)>> =
-        futures::stream::iter(fetches)
-            .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
-            .collect()
-            .await;
-
-    let mut enriched_all = true;
-    for result in results {
-        let Some((idx, per_column)) = result else {
-            enriched_all = false;
+    footer_stats: Vec<FooterSortStats>,
+    read_schema: &SchemaRef,
+) {
+    for ((file, _), per_column) in files.iter_mut().zip(footer_stats) {
+        let Some(per_column) = per_column else {
             continue;
         };
-        let file = &mut files[idx].0;
         let stats = file
             .statistics
-            .get_or_insert_with(|| Arc::new(Statistics::new_unknown(&read_schema)));
+            .get_or_insert_with(|| Arc::new(Statistics::new_unknown(read_schema)));
         let stats = Arc::make_mut(stats);
         for (column, (min, max, null_count)) in per_column {
             let Some(column_stats) = stats.column_statistics.get_mut(column) else {
-                enriched_all = false;
                 continue;
             };
-            // Only fill gaps: Delta add-file stats, when present, stay authoritative.
-            // Footer min/max may be truncated bounds (strings), hence `Inexact` — still a
-            // valid bound for the non-overlap check.
             if column_stats.min_value.get_value().is_none() {
                 column_stats.min_value = Precision::Inexact(min);
             }
@@ -1049,7 +1027,34 @@ async fn enrich_sort_column_stats(
             }
         }
     }
-    enriched_all
+}
+
+/// Longest prefix of `ordering` for which **every** file carries min/max stats on a plain
+/// column — the largest claim DataFusion's stats-based validation can actually confirm.
+/// Zero means not even the lead column is stats-backed everywhere.
+fn stats_backed_prefix_len(
+    files: &[(PartitionedFile, Option<Vec<bool>>)],
+    ordering: &LexOrdering,
+) -> usize {
+    use datafusion::physical_expr::expressions::Column;
+    ordering
+        .iter()
+        .take_while(|expr| {
+            expr.expr.downcast_ref::<Column>().is_some_and(|column| {
+                files.iter().all(|(file, _)| {
+                    file.statistics.as_ref().is_some_and(|stats| {
+                        stats
+                            .column_statistics
+                            .get(column.index())
+                            .is_some_and(|cs| {
+                                cs.min_value.get_value().is_some()
+                                    && cs.max_value.get_value().is_some()
+                            })
+                    })
+                })
+            })
+        })
+        .count()
 }
 
 /// (min, max, null_count) of one column across all row groups, from footer statistics.
@@ -1528,6 +1533,38 @@ mod tests {
                 .collect_vec()
         };
         assert_eq!(paths(&regrouped), paths(&groups));
+    }
+
+    #[test]
+    fn test_stats_backed_prefix_len_stops_at_first_statless_sort_column() {
+        use arrow_schema::SortOptions;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+
+        // Two sort columns; only the lead one (ts) has min/max stats — the MOR reality where
+        // the tiebreak id is not a predicate column so Delta never materializes its stats.
+        let ordering = LexOrdering::new([
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("ts", 0)),
+                SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            ),
+            PhysicalSortExpr::new(Arc::new(Column::new("id", 1)), SortOptions::default()),
+        ])
+        .unwrap();
+        let files = vec![
+            (ordered_file("a", 0, 100), None::<Vec<bool>>),
+            (ordered_file("b", 50, 150), None),
+        ];
+        assert_eq!(stats_backed_prefix_len(&files, &ordering), 1);
+
+        // A single file without stats disables even the lead column.
+        let mut no_stats = ordered_file("c", 120, 200);
+        no_stats.statistics = None;
+        let mut files = files;
+        files.push((no_stats, None));
+        assert_eq!(stats_backed_prefix_len(&files, &ordering), 0);
     }
 
     #[test]
