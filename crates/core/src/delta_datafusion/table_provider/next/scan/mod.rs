@@ -793,16 +793,31 @@ async fn get_read_plan(
         // the full key, hence by any prefix) and is what TopK / bounded dedup need.
         // `regroup` is false when not even the lead column is stats-backed: declare the full
         // ordering over the untouched grouping and let validation decide, exactly as before.
-        let (output_ordering, regroup) = match derived_ordering {
-            Some((ordering, footer_stats)) => {
+        // Isolate, don't surrender. A file with no (or a different) footer ordering used to
+        // void the claim for the WHOLE scan — one unsorted file among thousands cost every
+        // other file its ordering, which is what turns off the streaming top-N pushdown and
+        // forces merge-on-read dedup into its unbounded `full-set` seen-set. Prod ran with
+        // 55% of active files unsorted, so that "one bad file" case was the common case.
+        // Now the conforming majority keeps the claim and the rest scan separately, unordered.
+        let (mut files, mut unordered_files, output_ordering, regroup) = match derived_ordering {
+            Some((ordering, footer_stats, conforms)) => {
                 apply_footer_sort_stats(&mut files, footer_stats, parquet_read_schema);
-                match stats_backed_prefix_len(&files, &ordering) {
+                let (conforming, rest) = split_by_declared_ordering(files, &conforms);
+                // Prefix length is a property of the files that will actually carry the
+                // claim, so it must be measured on the conforming set alone.
+                let (ordering, regroup) = match stats_backed_prefix_len(&conforming, &ordering) {
                     0 => (Some(ordering), false),
                     len => (LexOrdering::new(ordering.iter().take(len).cloned()), true),
-                }
+                };
+                (conforming, rest, ordering, regroup)
             }
-            None => (None, false),
+            None => (files, Vec::new(), None, false),
         };
+        // Nothing conformed (or nothing to claim): one plain scan over everything, exactly
+        // as before.
+        if output_ordering.is_none() && !unordered_files.is_empty() {
+            files.append(&mut unordered_files);
+        }
 
         if let Some(selections) = row_ordinal_selections
             && !selections.is_empty()
@@ -828,13 +843,14 @@ async fn get_read_plan(
             _ => file_groups,
         };
         let (file_groups, statistics) =
-            compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
+            compute_all_files_statistics(file_groups, full_table_schema.clone(), true, false)?;
 
-        let mut config = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
-            .with_file_groups(file_groups)
-            .with_statistics(statistics)
-            .with_limit(limit)
-            .with_expr_adapter(Some(adapter_factory.clone() as _));
+        let mut config =
+            FileScanConfigBuilder::new(store_url.clone(), Arc::new(file_source.clone()))
+                .with_file_groups(file_groups)
+                .with_statistics(statistics)
+                .with_limit(limit)
+                .with_expr_adapter(Some(adapter_factory.clone() as _));
         if let Some(ordering) = output_ordering {
             // Auto-enables `preserve_order`: DataFusion keeps each file group's order and
             // merges groups with a SortPreservingMergeExec instead of concatenating.
@@ -842,6 +858,24 @@ async fn get_read_plan(
         }
 
         plans.push(DataSourceExec::from_data_source(config.build()) as Arc<dyn ExecutionPlan>);
+
+        // The isolated non-conforming files: same source and predicate, no ordering claim.
+        // Unioned as a sibling so the ordered leg above keeps its pushdowns; DataFusion (and
+        // TimeFusion's `ordered_union_for_topk`) can then sort just this small leg when a
+        // query wants a global order, instead of the whole partition losing the claim.
+        if !unordered_files.is_empty() {
+            let groups =
+                partitioned_files_to_file_groups(unordered_files.into_iter().map(|file| file.0));
+            let (groups, statistics) =
+                compute_all_files_statistics(groups, full_table_schema, true, false)?;
+            let config = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
+                .with_file_groups(groups)
+                .with_statistics(statistics)
+                .with_limit(limit)
+                .with_expr_adapter(Some(adapter_factory.clone() as _))
+                .build();
+            plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
+        }
     }
 
     Ok(match plans.len() {
@@ -855,10 +889,30 @@ async fn get_read_plan(
 /// column of the file's declared footer ordering; `None` when some stat is unavailable.
 type FooterSortStats = Option<Vec<(usize, (ScalarValue, ScalarValue, usize))>>;
 
-/// Returns a scan-wide [`LexOrdering`] iff **every** file declares the **same** non-empty
-/// parquet `sorting_columns` footer, else `None`. The conservative all-or-nothing rule keeps
-/// the advertised ordering honest for the union of files: a single unsorted file (e.g. a
-/// Z-ordered/compacted file, which declares no ordering) disables the claim for the scan.
+/// Partition `files` by whether each one declares the scan's common ordering. Conforming
+/// files carry the claim; the rest are scanned separately with no claim at all.
+fn split_by_declared_ordering(
+    files: Vec<(PartitionedFile, Option<Vec<bool>>)>,
+    conforms: &[bool],
+) -> (
+    Vec<(PartitionedFile, Option<Vec<bool>>)>,
+    Vec<(PartitionedFile, Option<Vec<bool>>)>,
+) {
+    let (conforming, rest): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .enumerate()
+        .partition(|(idx, _)| conforms.get(*idx).copied().unwrap_or(false));
+    (
+        conforming.into_iter().map(|(_, file)| file).collect(),
+        rest.into_iter().map(|(_, file)| file).collect(),
+    )
+}
+
+/// Returns the [`LexOrdering`] the **largest set** of files agree on, plus which files
+/// declare it. Previously this was all-or-nothing — every file had to declare the same
+/// non-empty parquet `sorting_columns` footer or the scan lost its ordering entirely — which
+/// meant one unsorted file (a compacted/Z-ordered output, or a flush whose sort was skipped)
+/// cost every other file its claim. The caller now isolates the non-conforming files instead.
 ///
 /// Alongside the ordering, returns each file's sort-column min/max/null-count extracted from
 /// the **same** footers (indexed like `files`) — the ordering only survives DataFusion's
@@ -869,7 +923,7 @@ async fn derive_common_ordering(
     cache: Arc<dyn FileMetadataCache>,
     files: &[(PartitionedFile, Option<Vec<bool>>)],
     read_schema: SchemaRef,
-) -> Option<(LexOrdering, Vec<FooterSortStats>)> {
+) -> Option<(LexOrdering, Vec<FooterSortStats>, Vec<bool>)> {
     use datafusion::physical_expr::expressions::Column;
     // Fetch footers concurrently (bounded). On a cold metadata cache a scan can span hundreds
     // of files; a serial loop would add that many sequential footer reads to *planning*. The
@@ -920,19 +974,35 @@ async fn derive_common_ordering(
             .collect()
             .await;
 
-    let mut common: Option<LexOrdering> = None;
+    // Pick the ordering the most files agree on, rather than bailing at the first
+    // disagreement. `conforms[i]` then says whether file i can be scanned under that
+    // claim; the caller isolates the rest into their own unordered scan instead of
+    // losing the claim for everything (see `split_by_declared_ordering`).
+    let mut per_file: Vec<Option<LexOrdering>> = vec![None; file_count];
     let mut footer_stats: Vec<FooterSortStats> = vec![None; file_count];
     for (idx, ordering, stats) in results {
-        // Any missing footer or fetch error disables the claim for the whole scan.
-        let ordering = ordering?;
-        match &common {
-            None => common = Some(ordering),
-            Some(existing) if *existing != ordering => return None,
-            _ => {}
-        }
+        per_file[idx] = ordering;
         footer_stats[idx] = stats;
     }
-    common.map(|ordering| (ordering, footer_stats))
+    let mut tally: Vec<(LexOrdering, usize)> = Vec::new();
+    for ordering in per_file.iter().flatten() {
+        match tally
+            .iter_mut()
+            .find(|(candidate, _)| candidate == ordering)
+        {
+            Some((_, count)) => *count += 1,
+            None => tally.push((ordering.clone(), 1)),
+        }
+    }
+    let common = tally
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(ordering, _)| ordering)?;
+    let conforms: Vec<bool> = per_file
+        .iter()
+        .map(|ordering| ordering.as_ref().is_some_and(|o| *o == common))
+        .collect();
+    Some((common, footer_stats, conforms))
 }
 
 /// Upper bound on file groups produced when repacking for a declared ordering. Heavily
