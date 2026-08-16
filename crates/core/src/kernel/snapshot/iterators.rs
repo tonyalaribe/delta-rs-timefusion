@@ -325,6 +325,7 @@ impl LogicalFileView {
 
     /// Internal API
     pub(crate) fn to_add(&self) -> Add {
+        let tags = self.tags();
         Add {
             path: self.path().to_string(),
             partition_values: self.partition_values_map(),
@@ -332,7 +333,7 @@ impl LogicalFileView {
             modification_time: self.modification_time(),
             data_change: true,
             stats: self.stats(),
-            tags: None,
+            tags: (!tags.is_empty()).then_some(tags),
             deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
             base_row_id: None,
             default_row_commit_version: None,
