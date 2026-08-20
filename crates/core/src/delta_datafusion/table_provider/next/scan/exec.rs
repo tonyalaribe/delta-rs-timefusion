@@ -465,32 +465,38 @@ impl ExecutionPlan for DeltaScanExec {
         }
 
         let adapter_factory = DefaultPhysicalExprAdapterFactory {};
-        let adapted_filters = adapter_factory
-            .create(
-                Arc::clone(&self.scan_plan.contract.result_schema),
-                self.input.schema(),
-            )
-            .and_then(|adapter| {
-                parent_filters
+        match adapter_factory.create(
+            Arc::clone(&self.scan_plan.contract.result_schema),
+            self.input.schema(),
+        ) {
+            Ok(adapter) => {
+                // Per-filter: one filter that fails to adapt (e.g. references a
+                // UDF or column the child schema can't express) must not mark
+                // EVERY parent filter unsupported — that was the same
+                // all-or-nothing that poisoned the provider-level parquet
+                // predicate. The sentinel column makes DataFusion report just
+                // that one filter as unsupported.
+                let unsupported = || {
+                    Arc::new(Column::new(DELTA_MATERIALIZED_PUSHDOWN_SENTINEL, usize::MAX))
+                        as Arc<dyn PhysicalExpr>
+                };
+                let filters = parent_filters
                     .iter()
                     .map(|filter| {
                         if self.references_delta_materialized_column(filter) {
                             // DataFusion has no public API for mixed parent filter support.
                             // Pass an impossible child column to `from_children`; DataFusion
                             // reports this parent filter as unsupported.
-                            Ok(Arc::new(Column::new(
-                                DELTA_MATERIALIZED_PUSHDOWN_SENTINEL,
-                                usize::MAX,
-                            )) as Arc<dyn PhysicalExpr>)
+                            unsupported()
                         } else {
-                            adapter.rewrite(Arc::clone(filter))
+                            adapter
+                                .rewrite(Arc::clone(filter))
+                                .unwrap_or_else(|_| unsupported())
                         }
                     })
-                    .collect::<Result<Vec<_>>>()
-            });
-
-        match adapted_filters {
-            Ok(filters) => FilterDescription::from_children(filters, &self.children()),
+                    .collect();
+                FilterDescription::from_children(filters, &self.children())
+            }
             Err(_) => Ok(FilterDescription::all_unsupported(
                 &parent_filters,
                 &self.children(),

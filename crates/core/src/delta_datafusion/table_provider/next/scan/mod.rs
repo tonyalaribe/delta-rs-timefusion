@@ -732,40 +732,57 @@ async fn get_read_plan(
         // interfere with other delta features like row ids.
         let has_selection_vectors = files.iter().any(|(_, sv)| sv.is_some());
         if !has_selection_vectors && let Some(pred) = predicate {
-            match state.create_physical_expr(pred.clone(), &parquet_predicate_df_schema) {
-                Ok(physical) => match adapter_factory
-                    .create(parquet_predicate_schema.clone(), full_read_schema.clone())
-                {
-                    Ok(adapter) => match adapter.rewrite(physical) {
-                        Ok(rewritten) => {
-                            file_source = file_source
-                                .with_predicate(rewritten)
-                                .with_pushdown_filters(true);
+            // One non-convertible conjunct (e.g. a UDF like `text_match`) must not
+            // discard the whole parquet predicate — that stranded the convertible
+            // equality/timestamp terms above the scan and decoded entire windows
+            // (prod 2026-08-20: a 4h delta window emitted 2.11M rows for an
+            // equality matching 0). Bind each top-level AND term independently
+            // and push the survivors. OR subtrees stay atomic (`split_conjunction`
+            // only splits top-level ANDs), and the complete original expression
+            // remains in DataFusion's post-scan Filter (pushdown is Inexact), so
+            // dropping a term here is purely a lost optimization, never a
+            // correctness change.
+            match adapter_factory.create(parquet_predicate_schema.clone(), full_read_schema.clone()) {
+                Ok(adapter) => {
+                    let rewritten = datafusion::logical_expr::utils::split_conjunction(pred)
+                        .into_iter()
+                        .filter_map(|term| {
+                            state
+                                .create_physical_expr(term.clone(), &parquet_predicate_df_schema)
+                                .and_then(|physical| adapter.rewrite(physical))
+                                .map_err(|err| {
+                                    debug!(
+                                        term = ?term,
+                                        error = %err,
+                                        "Skipping one parquet predicate conjunct that failed to bind or adapt"
+                                    );
+                                })
+                                .ok()
+                        })
+                        .reduce(|l, r| {
+                            Arc::new(datafusion::physical_plan::expressions::BinaryExpr::new(
+                                l,
+                                datafusion::logical_expr::Operator::And,
+                                r,
+                            )) as _
+                        });
+                    match rewritten {
+                        Some(expr) => {
+                            file_source = file_source.with_predicate(expr).with_pushdown_filters(true);
                         }
-                        Err(err) => {
-                            debug!(
-                                predicate = ?pred,
-                                schema = ?parquet_predicate_schema,
-                                error = %err,
-                                "Skipping parquet predicate pushdown because predicate adaptation to the read schema failed"
-                            );
-                        }
-                    },
-                    Err(err) => {
-                        debug!(
+                        None => debug!(
                             predicate = ?pred,
                             schema = ?parquet_predicate_schema,
-                            error = %err,
-                            "Skipping parquet predicate pushdown because predicate adapter creation failed"
-                        );
+                            "Skipping parquet predicate pushdown: no conjunct could be bound"
+                        ),
                     }
-                },
+                }
                 Err(err) => {
                     debug!(
                         predicate = ?pred,
                         schema = ?parquet_predicate_schema,
                         error = %err,
-                        "Skipping parquet predicate pushdown because predicate binding failed"
+                        "Skipping parquet predicate pushdown because predicate adapter creation failed"
                     );
                 }
             }
@@ -2634,6 +2651,83 @@ mod tests {
             "| 2  | memory:///test_rewrite_failure.parquet |",
             "| 3  | memory:///test_rewrite_failure.parquet |",
             "+----+----------------------------------------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &batches);
+
+        Ok(())
+    }
+
+    /// One non-bindable conjunct (a UDF like `text_match`, or here a column the
+    /// read schema can't express) must not discard the WHOLE parquet predicate:
+    /// the convertible terms still push down. Regression for prod 2026-08-20,
+    /// where `col = 'x' AND text_match(col, 'x')` lost the equality and decoded
+    /// a full 4h window (2.11M rows) for a predicate matching 0.
+    #[tokio::test]
+    async fn test_predicate_pushdown_keeps_bindable_conjuncts() -> TestResult {
+        let store = Arc::new(InMemory::new());
+        let store_url = Url::parse("memory:///")?;
+        let session = Arc::new(create_session().into_inner());
+        session
+            .runtime_env()
+            .register_object_store(&store_url, store.clone());
+
+        let parquet_read_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let logical_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("missing", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            parquet_read_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+
+        let mut buffer = Vec::new();
+        let mut arrow_writer =
+            ArrowWriter::try_new(&mut buffer, parquet_read_schema.clone(), None)?;
+        arrow_writer.write(&data)?;
+        arrow_writer.close()?;
+
+        let path = Path::from("test_mixed_conjunction.parquet");
+        store.put(&path, buffer.into()).await?;
+        let mut file: PartitionedFile = store.head(&path).await?.into();
+        file.partition_values
+            .push(wrap_file_id_value("memory:///test_mixed_conjunction.parquet"));
+
+        let files_by_store = vec![(
+            store_url.as_object_store_url(),
+            vec![(file, None::<Vec<bool>>)],
+        )];
+
+        let file_id_field =
+            crate::delta_datafusion::file_id::file_id_field(Some(FILE_ID_COLUMN_DEFAULT));
+        let parquet_predicate_schema =
+            build_parquet_predicate_schema(&logical_schema, &file_id_field);
+        // `missing = 1` cannot be adapted to the read schema; `id = 2` can and
+        // must survive the split. An OR containing the bad column stays atomic
+        // and is dropped whole.
+        let predicate = col("id")
+            .eq(lit(2i32))
+            .and(col("missing").eq(lit(1i32)).or(col("id").eq(lit(3i32))));
+
+        let plan = get_read_plan(
+            &session.state(),
+            files_by_store,
+            &parquet_read_schema,
+            &parquet_predicate_schema,
+            None,
+            &file_id_field,
+            Some(&predicate),
+            None,
+        )
+        .await?;
+        let batches = collect(plan, session.task_ctx()).await?;
+        let expected = vec![
+            "+----+------------------------------------------+",
+            "| id | __delta_rs_file_id__                     |",
+            "+----+------------------------------------------+",
+            "| 2  | memory:///test_mixed_conjunction.parquet |",
+            "+----+------------------------------------------+",
         ];
         assert_batches_sorted_eq!(&expected, &batches);
 
