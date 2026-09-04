@@ -39,7 +39,7 @@ use datafusion::{
         ParquetSource,
         parquet::{
             ParquetAccessPlan, RowGroupAccess,
-            metadata::{DFParquetMetadata, ordering_from_parquet_metadata},
+            metadata::DFParquetMetadata,
         },
     },
     error::DataFusionError,
@@ -925,6 +925,116 @@ fn split_by_declared_ordering(
     )
 }
 
+/// The footer's sort order, truncated at the first sort column this scan cannot bind —
+/// and only when every row group agrees on it.
+///
+/// DataFusion's `ordering_from_parquet_metadata` FILTERS unbindable sort columns out and
+/// keeps the ones after them, which turns a short truth into a long lie: a file sorted by
+/// `[timestamp, service, id]`, read under a projection without `service`, is declared
+/// sorted by `[timestamp, id]` — and within one timestamp its ids do not ascend.
+///
+/// TimeFusion shipped exactly that lie. `SortingColumn.column_idx` indexes parquet LEAVES,
+/// not fields, so every file written before 2026-09-03 names `attributes___user___email`
+/// where `resource___service___name` belongs. The reader could not bind that name, dropped
+/// it, and advertised `[timestamp DESC, id ASC]` over data ordered by service — the only
+/// visible symptom being a nonzero `ordering_violations_delta`.
+///
+/// A PREFIX of a sort order is always sound (a file sorted by the full key is sorted by
+/// any prefix of it); a SUBSEQUENCE is not. So stop at the first column that does not
+/// bind instead of skipping it. Position 0 survives this for every file TimeFusion ever
+/// wrote, because the leaf/field offset cannot accumulate before the first nested column.
+fn ordering_from_footer_prefix(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    schema: &SchemaRef,
+) -> Option<LexOrdering> {
+    use arrow::compute::SortOptions;
+    use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+
+    // `sorting_columns` is per-row-group, so one row group's claim says nothing about the
+    // file as a whole. Upstream reads only the first; require unanimity instead, which can
+    // only ever shrink what we claim.
+    let mut groups = metadata.row_groups().iter().map(|rg| rg.sorting_columns());
+    let sorting_columns = groups.next().flatten().filter(|cols| !cols.is_empty())?;
+    if !groups.all(|other| other.is_some_and(|cols| cols == sorting_columns)) {
+        return None;
+    }
+
+    let parquet_schema = metadata.file_metadata().schema_descr();
+    LexOrdering::new(sorting_columns.iter().map_while(|sc| {
+        let name = parquet_schema.columns().get(sc.column_idx as usize)?.name();
+        let (index, _) = schema.column_with_name(name)?;
+        Some(PhysicalSortExpr::new(
+            Arc::new(Column::new(name, index)),
+            SortOptions {
+                descending: sc.descending,
+                nulls_first: sc.nulls_first,
+            },
+        ))
+    }))
+}
+
+/// The longest sort prefix the files AGREE on, plus which of them carry it.
+///
+/// Anchors on the ordering the plurality declared, then shortens it to the longest prefix
+/// every lead-sharing file also declares. Requiring exact equality instead made agreement
+/// all-or-nothing: a table mid-migration holds two honest-but-different footer generations,
+/// and the minority generation was isolated into an unordered sibling scan even though both
+/// are sorted by the same lead column.
+///
+/// That is the 14/30-day cliff. Prod 2026-09-04: files written before the leaf-index footer
+/// fix declare `[timestamp, id]` and files after it `[timestamp, service, id]`, so any
+/// window spanning 2026-09-03 isolated one generation or the other — ~3.1 GB on a dashboard
+/// query, 16.5 GB at 30 days. Both are far past `read_sort_unordered_leg_max_mb`, so the
+/// read-time sort repair declined, the union lost its ordering claim, and `DedupExec` fell
+/// back to its unbounded `full-set` seen-set. A 30-day `COUNT(*)` then could not finish
+/// inside a 60 s statement timeout, while the same 31 days queried one at a time summed to
+/// 28 s.
+///
+/// Shortening costs nothing when every footer already matches — the minimum IS the full
+/// length — and `[timestamp]` alone is what bounded dedup and the streaming top-N need.
+/// Files sharing no lead column agree on nothing and stay isolated, which is the case
+/// isolation exists for.
+fn agreed_ordering_prefix(
+    per_file: &[Option<LexOrdering>],
+) -> Option<(LexOrdering, Vec<bool>)> {
+    let mut tally: Vec<(&LexOrdering, usize)> = Vec::new();
+    for ordering in per_file.iter().flatten() {
+        match tally
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == ordering)
+        {
+            Some((_, count)) => *count += 1,
+            None => tally.push((ordering, 1)),
+        }
+    }
+    let anchor = tally
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(ordering, _)| ordering)?;
+
+    let prefix_len = |ordering: &LexOrdering| {
+        ordering
+            .iter()
+            .zip(anchor.iter())
+            .take_while(|(lhs, rhs)| lhs == rhs)
+            .count()
+    };
+    // Only files that share the lead column constrain the claim; a file agreeing on
+    // nothing would otherwise drag the prefix to zero and cost every file its ordering.
+    let len = per_file
+        .iter()
+        .flatten()
+        .map(&prefix_len)
+        .filter(|&len| len > 0)
+        .min()?;
+    let common = LexOrdering::new(anchor.iter().take(len).cloned())?;
+    let conforms = per_file
+        .iter()
+        .map(|ordering| ordering.as_ref().is_some_and(|o| prefix_len(o) >= len))
+        .collect();
+    Some((common, conforms))
+}
+
 /// Returns the [`LexOrdering`] the **largest set** of files agree on, plus which files
 /// declare it. Previously this was all-or-nothing — every file had to declare the same
 /// non-empty parquet `sorting_columns` footer or the scan lost its ordering entirely — which
@@ -963,11 +1073,9 @@ async fn derive_common_ordering(
                     .fetch_metadata()
                     .await
                     .ok();
-                let ordering = meta.as_ref().and_then(|meta| {
-                    ordering_from_parquet_metadata(meta, &read_schema)
-                        .ok()
-                        .flatten()
-                });
+                let ordering = meta
+                    .as_ref()
+                    .and_then(|meta| ordering_from_footer_prefix(meta, &read_schema));
                 let stats: FooterSortStats =
                     ordering
                         .as_ref()
@@ -991,7 +1099,7 @@ async fn derive_common_ordering(
             .collect()
             .await;
 
-    // Pick the ordering the most files agree on, rather than bailing at the first
+    // Claim the prefix the most files agree on, rather than bailing at the first
     // disagreement. `conforms[i]` then says whether file i can be scanned under that
     // claim; the caller isolates the rest into their own unordered scan instead of
     // losing the claim for everything (see `split_by_declared_ordering`).
@@ -1001,24 +1109,7 @@ async fn derive_common_ordering(
         per_file[idx] = ordering;
         footer_stats[idx] = stats;
     }
-    let mut tally: Vec<(LexOrdering, usize)> = Vec::new();
-    for ordering in per_file.iter().flatten() {
-        match tally
-            .iter_mut()
-            .find(|(candidate, _)| candidate == ordering)
-        {
-            Some((_, count)) => *count += 1,
-            None => tally.push((ordering.clone(), 1)),
-        }
-    }
-    let common = tally
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(ordering, _)| ordering)?;
-    let conforms: Vec<bool> = per_file
-        .iter()
-        .map(|ordering| ordering.as_ref().is_some_and(|o| *o == common))
-        .collect();
+    let (common, conforms) = agreed_ordering_prefix(&per_file)?;
     Some((common, footer_stats, conforms))
 }
 
@@ -1620,6 +1711,74 @@ mod tests {
                 .collect_vec()
         };
         assert_eq!(paths(&regrouped), paths(&groups));
+    }
+
+    /// `[(column, descending)]` -> a `LexOrdering`, so a case table reads as the footer
+    /// generations it stands for.
+    fn ordering_of(cols: &[(&str, bool)]) -> Option<LexOrdering> {
+        use arrow::compute::SortOptions;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+        LexOrdering::new(cols.iter().enumerate().map(|(idx, (name, descending))| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, idx)),
+                SortOptions {
+                    descending: *descending,
+                    nulls_first: *descending,
+                },
+            )
+        }))
+    }
+
+    /// THE 14/30-day cliff, as a table. The prod shape is the third case: two honest footer
+    /// generations either side of the leaf-index fix, agreeing only on `timestamp`. Before
+    /// this, exact equality isolated a whole generation — 3.1 GB on a dashboard query, past
+    /// every read-time sort budget — and `DedupExec` fell to `full-set`.
+    #[test]
+    fn test_agreed_ordering_prefix_keeps_every_generation_under_the_shared_prefix() {
+        let legacy = &[("timestamp", true), ("id", false)][..];
+        let modern = &[("timestamp", true), ("service", false), ("id", false)][..];
+
+        for (name, files, want_len, want_conforms) in [
+            // Unanimous footers must be untouched: the minimum IS the full length, so a
+            // homogeneous table keeps the long claim it has today.
+            ("all modern", vec![modern, modern], 3, vec![true, true]),
+            ("all legacy", vec![legacy, legacy], 2, vec![true, true]),
+            // Mixed: claim `[timestamp]`, and BOTH generations conform (nothing isolated).
+            (
+                "mixed generations",
+                vec![modern, legacy, modern],
+                1,
+                vec![true, true, true],
+            ),
+        ] {
+            let per_file: Vec<_> = files.iter().map(|cols| ordering_of(cols)).collect();
+            let (common, conforms) =
+                agreed_ordering_prefix(&per_file).expect("a claim must survive");
+            assert_eq!(common.len(), want_len, "{name}: claimed prefix length");
+            assert_eq!(conforms, want_conforms, "{name}: conformance");
+        }
+    }
+
+    /// A file agreeing on NOTHING must be isolated, not allowed to drag the shared prefix
+    /// to zero — that would cost every other file its claim, which is the failure the
+    /// isolation split exists to prevent.
+    #[test]
+    fn test_agreed_ordering_prefix_isolates_a_file_sharing_no_lead_column() {
+        let per_file = vec![
+            ordering_of(&[("timestamp", true), ("id", false)]),
+            ordering_of(&[("timestamp", true), ("id", false)]),
+            ordering_of(&[("other", false)]),
+            None,
+        ];
+
+        let (common, conforms) = agreed_ordering_prefix(&per_file).expect("a claim survives");
+
+        assert_eq!(common.len(), 2, "the majority keeps its full claim");
+        assert_eq!(
+            conforms,
+            vec![true, true, false, false],
+            "the rogue file and the footer-less file are isolated"
+        );
     }
 
     #[test]
