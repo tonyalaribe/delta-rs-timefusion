@@ -855,7 +855,7 @@ async fn get_read_plan(
         // the grouping exactly as-is.
         let file_groups = match &output_ordering {
             Some(ordering) if regroup => {
-                regroup_for_declared_ordering(file_groups, ordering, &full_table_schema)
+                regroup_for_declared_ordering(file_groups, ordering, &full_table_schema, state.config().target_partitions())
             }
             _ => file_groups,
         };
@@ -1135,8 +1135,25 @@ fn regroup_for_declared_ordering(
     file_groups: Vec<FileGroup>,
     ordering: &LexOrdering,
     table_schema: &SchemaRef,
+    target_partitions: usize,
 ) -> Vec<FileGroup> {
-    let target_partitions = file_groups.len().max(1);
+    // WIDEN ONLY. This used to pass `file_groups.len()`, pinning the scan's
+    // parallelism to whatever grouping the Delta snapshot happened to arrive
+    // with — 21 groups on a 30-day prod window, on a 48-core box whose session
+    // `target_partitions` is 48. Each group is one sequential reader, so that
+    // capped IN-QUERY read concurrency at 21 regardless of available cores.
+    //
+    // It is why two client sessions beat one query on the same work: prod
+    // 2026-09-04, two concurrent 15-day queries ran 11.8/21.3/14.6 s against
+    // 37.8/43.0/30.2 s for the single 30-day query — ~3x, purely from having
+    // ~44 reads in flight instead of ~21. The scan is IO-bound (container CPU
+    // is identical with and without the query), so reads in flight IS the
+    // throughput.
+    //
+    // Never NARROW below the incoming grouping: fewer groups would merge files
+    // back together, and a group is only valid while its files stay
+    // non-overlapping in the sort key.
+    let target_partitions = target_partitions.max(file_groups.len()).max(1);
     match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
         &file_groups,
@@ -1638,7 +1655,7 @@ mod tests {
         let groups = partitioned_files_to_file_groups(files);
         assert_eq!(groups.len(), 1);
 
-        let regrouped = regroup_for_declared_ordering(groups, &ts_ordering(true), &ts_schema());
+        let regrouped = regroup_for_declared_ordering(groups, &ts_ordering(true), &ts_schema(), 0);
 
         let total: usize = regrouped.iter().map(FileGroup::len).sum();
         assert_eq!(total, 3, "no file may be lost or duplicated");
@@ -1673,6 +1690,7 @@ mod tests {
             partitioned_files_to_file_groups(files.clone()),
             &ts_ordering(false),
             &ts_schema(),
+            0,
         );
         assert_eq!(asc.len(), 1, "disjoint files must not fan out into singles");
         assert_eq!(group_ranges(&asc[0]), vec![(0, 9), (10, 19), (20, 29)]);
@@ -1681,6 +1699,7 @@ mod tests {
             partitioned_files_to_file_groups(files),
             &ts_ordering(true),
             &ts_schema(),
+            0,
         );
         assert_eq!(desc.len(), 1);
         assert_eq!(group_ranges(&desc[0]), vec![(20, 29), (10, 19), (0, 9)]);
@@ -1698,7 +1717,7 @@ mod tests {
         let groups = partitioned_files_to_file_groups(files);
 
         let regrouped =
-            regroup_for_declared_ordering(groups.clone(), &ts_ordering(true), &ts_schema());
+            regroup_for_declared_ordering(groups.clone(), &ts_ordering(true), &ts_schema(), 0);
 
         let paths = |groups: &[FileGroup]| {
             groups
@@ -1781,6 +1800,48 @@ mod tests {
         );
     }
 
+    /// A scan's parallelism must follow the SESSION, not whatever grouping the
+    /// snapshot arrived with. Each group is one sequential reader, so pinning the
+    /// target to `file_groups.len()` capped in-query read concurrency at 21 on a
+    /// 48-core prod box — the measured reason two client sessions beat one query
+    /// ~3x on the same 30 days of IO-bound work.
+    #[test]
+    fn test_regroup_widens_to_target_partitions_but_never_narrows() {
+        // Disjoint files pack into ONE group when nothing forces a split...
+        let files = vec![
+            ordered_file("a", 0, 9),
+            ordered_file("b", 10, 19),
+            ordered_file("c", 20, 29),
+            ordered_file("d", 30, 39),
+        ];
+        let packed = regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files.clone()),
+            &ts_ordering(false),
+            &ts_schema(),
+            0,
+        );
+        assert_eq!(packed.len(), 1, "baseline: disjoint files pack together");
+
+        // ...and asking for more partitions must spread them for concurrency,
+        // without losing or duplicating a single file.
+        let widened = regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files.clone()),
+            &ts_ordering(false),
+            &ts_schema(),
+            4,
+        );
+        assert!(widened.len() > packed.len(), "a higher target must fan out, got {} group(s)", widened.len());
+        assert_eq!(widened.iter().map(FileGroup::len).sum::<usize>(), files.len(), "no file lost or duplicated");
+
+        // Never NARROW: a target below the incoming grouping would merge files
+        // back together, and a group is only valid while its files stay
+        // non-overlapping in the sort key.
+        let overlapping = vec![ordered_file("x", 0, 100), ordered_file("y", 50, 150)];
+        let incoming = partitioned_files_to_file_groups(overlapping);
+        let forced = regroup_for_declared_ordering(incoming.clone(), &ts_ordering(false), &ts_schema(), 1);
+        assert!(forced.len() >= incoming.len(), "overlapping files must not be merged by a low target");
+    }
+
     #[test]
     fn test_stats_backed_prefix_len_stops_at_first_statless_sort_column() {
         use arrow_schema::SortOptions;
@@ -1848,6 +1909,7 @@ mod tests {
             partitioned_files_to_file_groups(files),
             &ordering,
             &schema,
+            0,
         ));
         assert!(
             repacked.output_ordering().is_some(),
