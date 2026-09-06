@@ -574,6 +574,11 @@ impl DeltaScanStream {
         file_id: String,
         file_id_idx: usize,
     ) -> Result<RecordBatch> {
+        // Physical row count of THIS parquet batch, captured before the DV mask
+        // drops rows — the row-index column must number physical positions, not
+        // post-mask ordinals (a DV consumer unions these onto a physical bitmap).
+        let raw_num_rows = batch.num_rows();
+
         let dv_result = if let Some(mut selection_vector) = self.selection_vectors.get_mut(&file_id)
         {
             consume_dv_mask(&mut selection_vector, batch.num_rows())
@@ -588,8 +593,12 @@ impl DeltaScanStream {
             self.selection_vectors.remove(&file_id);
         }
 
-        let mut batch = if let Some(selection) = dv_result.selection {
-            filter_record_batch(&batch, &BooleanArray::from(selection))?
+        // Keep the keep-mask: it filters both the data batch and, in
+        // `append_row_index`, the physical row-index column so survivors retain
+        // their physical positions.
+        let selection = dv_result.selection;
+        let mut batch = if let Some(selection) = &selection {
+            filter_record_batch(&batch, &BooleanArray::from(selection.clone()))?
         } else {
             batch
         };
@@ -632,33 +641,55 @@ impl DeltaScanStream {
             )
         }?;
 
-        self.append_row_index(result, &file_id)
+        self.append_row_index(result, &file_id, raw_num_rows, selection.as_deref())
     }
 
-    fn append_row_index(&mut self, batch: RecordBatch, file_id: &str) -> Result<RecordBatch> {
+    /// Append the 1-based PHYSICAL parquet row index for each surviving row.
+    ///
+    /// `raw_num_rows` is the batch size BEFORE the DV mask; `selection` is that
+    /// mask (length `raw_num_rows`, `None` when the file has no active DV). The
+    /// counter advances by physical rows, then the physical index array is
+    /// filtered by the same mask so a DV-bearing file still reports physical
+    /// positions of survivors (e.g. `1,3,5,...`), not post-mask ordinals
+    /// (`1,2,3,...`). DV consumers union these onto a physical bitmap.
+    fn append_row_index(
+        &mut self,
+        batch: RecordBatch,
+        file_id: &str,
+        raw_num_rows: usize,
+        selection: Option<&[bool]>,
+    ) -> Result<RecordBatch> {
         let Some(row_index_field) = self.row_index_field.clone() else {
             return Ok(batch);
         };
 
-        let row_count = u64::try_from(batch.num_rows()).map_err(|_| {
+        let raw = u64::try_from(raw_num_rows).map_err(|_| {
             internal_datafusion_err!("batch row count does not fit u64 while assigning row indexes")
         })?;
         let next_row_index = self
             .row_index_by_file
             .entry(file_id.to_string())
             .or_default();
-        let end = next_row_index.checked_add(row_count).ok_or_else(|| {
+        let start = *next_row_index + 1;
+        let end = next_row_index.checked_add(raw).ok_or_else(|| {
             internal_datafusion_err!(
                 "row index overflow while assigning row indexes for file '{file_id}'"
             )
         })?;
-
-        let values = if row_count == 0 {
-            Vec::new()
-        } else {
-            ((*next_row_index + 1)..=end).collect()
-        };
         *next_row_index = end;
+
+        let values: Vec<u64> = match selection {
+            // Keep the physical index only for kept rows; aligns 1:1 with the
+            // already-filtered `batch`.
+            Some(sel) => (start..=end).zip(sel).filter_map(|(idx, keep)| keep.then_some(idx)).collect(),
+            None if raw_num_rows == 0 => Vec::new(),
+            None => (start..=end).collect(),
+        };
+        debug_assert_eq!(
+            values.len(),
+            batch.num_rows(),
+            "row-index count must match the DV-filtered batch"
+        );
 
         let row_index: ArrayRef = Arc::new(UInt64Array::from(values));
         let mut columns = batch.columns().to_vec();
