@@ -60,7 +60,7 @@ mod cdc;
 pub mod constraints;
 #[cfg(feature = "datafusion")]
 pub mod delete;
-pub(crate) mod deletion_vectors;
+pub mod deletion_vectors;
 #[cfg(feature = "datafusion")]
 mod load;
 #[cfg(feature = "datafusion")]

@@ -26,7 +26,7 @@ use crate::logstore::LogStore;
 use crate::{DeltaResult, DeltaTableError};
 
 /// One file's worth of newly-deleted physical row indexes plus its current add action.
-pub(crate) struct FileDeletion {
+pub struct FileDeletion {
     /// The current add action for the file (from `LogicalFileView::to_add`).
     pub add: Add,
     /// Physical row indexes (0-based, within the parquet file) to logically delete now.
@@ -41,7 +41,7 @@ const DV_MAGIC_LEN: usize = 4; // little-endian magic
 ///
 /// Returns `None` for inline DVs (no file) and for descriptors that don't decode. Used by
 /// VACUUM to treat DV files referenced by live Adds as valid (never garbage-collect them).
-pub(crate) fn dv_object_store_relative_path(desc: &DeletionVectorDescriptor) -> Option<String> {
+pub fn dv_object_store_relative_path(desc: &DeletionVectorDescriptor) -> Option<String> {
     match desc.storage_type {
         StorageType::UuidRelativePath => dv_relative_path(desc).ok(),
         // Absolute path: the descriptor already holds the object path/URL.
@@ -117,7 +117,7 @@ async fn read_existing_dv(
 /// `Add(same data-file path, merged DV descriptor)`. Files whose merged deletion set is
 /// empty are skipped. `table_root` is the table's object-store root URL, used only to
 /// keep the descriptor path relative.
-pub(crate) async fn write_deletion_vectors(
+pub async fn write_deletion_vectors(
     log_store: &dyn LogStore,
     _table_root: &Url,
     deletions: Vec<FileDeletion>,
