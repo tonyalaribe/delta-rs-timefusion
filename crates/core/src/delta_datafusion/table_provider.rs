@@ -372,8 +372,10 @@ impl TableProviderBuilder {
         self
     }
 
-    /// Add a row index column to scan output.
-    pub(crate) fn with_row_index_column(mut self, row_index_column: impl ToString) -> Self {
+    /// Add a per-file physical row index column to scan output. Public so
+    /// TimeFusion's DV-dedup can project `(file_path, row_index)` to locate the
+    /// physical rows to mark deleted via a deletion vector.
+    pub fn with_row_index_column(mut self, row_index_column: impl ToString) -> Self {
         self.row_index_column = Some(row_index_column.to_string());
         self
     }

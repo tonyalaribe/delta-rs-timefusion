@@ -288,6 +288,136 @@ mod tests {
         Ok(())
     }
 
+    /// Every live Add in the table (each backs one data file here).
+    async fn all_adds(table: &DeltaTable) -> Vec<Add> {
+        let snapshot = table.snapshot().unwrap().snapshot().clone();
+        snapshot
+            .file_views(table.log_store().as_ref(), None)
+            .map_ok(|v| v.to_add())
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    /// Scan the given adds exposing per-row source file + physical row index, and
+    /// return `(file_path, row_index)` pairs. Uses the fork's `with_file_column`
+    /// + `with_row_index_column` — the exact primitives DV-dedup (option D) relies
+    /// on to locate losers across multiple files in one scan.
+    async fn scan_file_and_row_index(table: &DeltaTable, adds: Vec<Add>) -> Vec<(String, u64)> {
+        use arrow::array::{StringArray, UInt64Array};
+        use datafusion::prelude::SessionContext;
+
+        let provider = table
+            .table_provider()
+            .with_file_column("__fpath")
+            .with_row_index_column("__ridx")
+            .with_adds(adds)
+            .build()
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+        let batches = ctx
+            .sql("SELECT __fpath, __ridx FROM t ORDER BY __fpath, __ridx")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        use arrow::compute::cast;
+        use arrow::datatypes::DataType as ADataType;
+        let mut out = Vec::new();
+        for b in &batches {
+            let paths_col = cast(b.column(0), &ADataType::Utf8).unwrap();
+            let idxs_col = cast(b.column(1), &ADataType::UInt64).unwrap();
+            let paths = paths_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let idxs = idxs_col.as_any().downcast_ref::<UInt64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push((paths.value(i).to_string(), idxs.value(i)));
+            }
+        }
+        out
+    }
+
+    /// THE GATE for DV-dedup option D: a single scan over MULTIPLE files must
+    /// expose a PER-FILE physical row index (restarting at 1 in each file), not a
+    /// global running counter. If it were global, driver-side loser positions
+    /// would be off by the sum of preceding files' rows and DV-dedup would delete
+    /// the wrong rows. Duplicate-key groups span files, so DV-dedup needs one
+    /// multi-file scan; delete.rs only ever scans one file at a time and never
+    /// exercised this.
+    #[tokio::test]
+    async fn row_index_is_per_file_across_a_multi_file_scan() -> DeltaResult<()> {
+        // Two separate appends => two data files.
+        let schema = StructType::try_new(vec![StructField::new(
+            "value",
+            DataType::Primitive(PrimitiveType::Integer),
+            true,
+        )])?;
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(schema.fields().cloned())
+            .with_configuration_property(TableProperty::EnableDeletionVectors, Some("true"))
+            .await?;
+        let table = table
+            .write(vec![values_batch(0..3)])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+        let table = table
+            .write(vec![values_batch(100..105)])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+
+        let adds = all_adds(&table).await;
+        assert_eq!(adds.len(), 2, "expected two data files");
+        let pairs = scan_file_and_row_index(&table, adds).await;
+
+        // Group indexes by file.
+        use std::collections::BTreeMap;
+        let mut by_file: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (path, idx) in pairs {
+            by_file.entry(path).or_default().push(idx);
+        }
+        assert_eq!(by_file.len(), 2, "rows must attribute to two distinct files");
+        let mut lens: Vec<usize> = by_file.values().map(Vec::len).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 5], "3-row file and 5-row file");
+        for (path, mut idxs) in by_file {
+            idxs.sort_unstable();
+            let n = idxs.len() as u64;
+            // 1-based, contiguous, restarting at 1 per file (delete.rs converts
+            // this to 0-based DV indexes via `v - 1`). A global counter would make
+            // the second file start at 4 (or 6), which this rejects.
+            assert_eq!(
+                idxs,
+                (1..=n).collect::<Vec<_>>(),
+                "file {path} row indexes must be per-file 1..={n}, got {idxs:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A file that already carries a DV must still report PHYSICAL row indexes for
+    /// its surviving rows (masked rows simply absent), so a second DV-dedup pass
+    /// unions physical positions onto the existing DV rather than shifting them.
+    #[tokio::test]
+    async fn row_index_stays_physical_on_a_dv_bearing_file() -> DeltaResult<()> {
+        let table = make_table().await; // one file, values 0..10
+        let table = commit_dv(table, vec![1, 3, 5]).await?; // mask physical rows 1,3,5
+        let adds = all_adds(&table).await;
+        assert_eq!(adds.len(), 1);
+        let pairs = scan_file_and_row_index(&table, adds).await;
+        let mut idxs: Vec<u64> = pairs.iter().map(|(_, i)| *i).collect();
+        idxs.sort_unstable();
+        // 1-based physical indexes of the SURVIVORS: 0,2,4,6,7,8,9 -> 1,3,5,7,8,9,10.
+        assert_eq!(
+            idxs,
+            vec![1, 3, 5, 7, 8, 9, 10],
+            "DV-masked scan must expose physical (not compacted) row indexes of survivors"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn dv_delete_all_rows_in_file_reads_empty() -> DeltaResult<()> {
         // Masking every row in a file (cardinality == numRecords) must yield an empty
