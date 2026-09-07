@@ -1686,6 +1686,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dv_row_index_survives_optimizer_file_splitting() -> TestResult {
+        let mut table = open_fs_path(DV_TABLE_PATH);
+        table.load().await?;
+        let provider = crate::delta_datafusion::TableProviderBuilder::default()
+            .with_log_store(table.log_store())
+            .with_eager_snapshot(Arc::new(table.snapshot()?.snapshot().clone()))
+            .with_file_column("file_id")
+            .with_row_index_column("row_ordinal")
+            .build()
+            .await?;
+        let mut config = datafusion::prelude::SessionConfig::new()
+            .with_batch_size(1)
+            .with_target_partitions(4);
+        config.options_mut().optimizer.repartition_file_min_size = 0;
+        let session = datafusion::prelude::SessionContext::new_with_config(config);
+        session.register_table("dv", Arc::new(provider))?;
+        let plan = session
+            .sql("SELECT letter, int, row_ordinal FROM dv")
+            .await?
+            .create_physical_plan()
+            .await?;
+        // Coalescing independently read byte ranges cannot recover physical row order.
+        let mut pending = vec![Arc::clone(&plan)];
+        let mut files = 0;
+        while let Some(node) = pending.pop() {
+            if let Some(source) =
+                node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+                && let Some(scan) = source
+                    .data_source()
+                    .downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>(
+                )
+            {
+                for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
+                    assert!(
+                        file.range.is_none(),
+                        "positional masks require whole-file scans"
+                    );
+                    files += 1;
+                }
+            }
+            pending.extend(node.children().into_iter().cloned());
+        }
+        assert!(files > 0, "must inspect the actual parquet scan");
+        let batches = collect(plan, session.task_ctx()).await?;
+        assert_batches_sorted_eq!(
+            &[
+                "+--------+-----+-------------+",
+                "| letter | int | row_ordinal |",
+                "+--------+-----+-------------+",
+                "| b      | 228 | 2           |",
+                "+--------+-----+-------------+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_dv_scan_reexecution_preserves_deleted_rows() -> TestResult {
         let table = open_fs_path(DV_TABLE_PATH);
         let provider = table.table_provider().await?;
