@@ -453,10 +453,19 @@ impl ExecutionPlan for DeltaScanExec {
         // the child parquet schema uses physical column names, so pushing the parent filter
         // through this exec again can rewrite it against the wrong child field. Provider level
         // predicate planning already handles the safe parquet pushdown path for these tables.
-        if self
-            .scan_plan
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::ColumnMapping)
+        // DV masks and retained row indices use physical file positions.
+        // Static and dynamic filters must stay above this node until those
+        // positions have been consumed, just like provider-level predicates.
+        if !self.selection_vectors.is_empty()
+            || self.scan_plan.contract.retained_row_index_field().is_some()
+            || self
+                .scan_plan
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::RowTracking)
+            || self
+                .scan_plan
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::ColumnMapping)
         {
             return Ok(FilterDescription::all_unsupported(
                 &parent_filters,
@@ -477,8 +486,10 @@ impl ExecutionPlan for DeltaScanExec {
                 // predicate. The sentinel column makes DataFusion report just
                 // that one filter as unsupported.
                 let unsupported = || {
-                    Arc::new(Column::new(DELTA_MATERIALIZED_PUSHDOWN_SENTINEL, usize::MAX))
-                        as Arc<dyn PhysicalExpr>
+                    Arc::new(Column::new(
+                        DELTA_MATERIALIZED_PUSHDOWN_SENTINEL,
+                        usize::MAX,
+                    )) as Arc<dyn PhysicalExpr>
                 };
                 let filters = parent_filters
                     .iter()
@@ -681,7 +692,10 @@ impl DeltaScanStream {
         let values: Vec<u64> = match selection {
             // Keep the physical index only for kept rows; aligns 1:1 with the
             // already-filtered `batch`.
-            Some(sel) => (start..=end).zip(sel).filter_map(|(idx, keep)| keep.then_some(idx)).collect(),
+            Some(sel) => (start..=end)
+                .zip(sel)
+                .filter_map(|(idx, keep)| keep.then_some(idx))
+                .collect(),
             None if raw_num_rows == 0 => Vec::new(),
             None => (start..=end).collect(),
         };
@@ -1709,6 +1723,41 @@ mod tests {
         ];
         assert_batches_sorted_eq!(&expected, &batches);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dv_scan_rejects_physical_filter_pushdown() -> TestResult {
+        let table = open_fs_path(DV_TABLE_PATH);
+        let provider = table.table_provider().await?;
+        let session = Arc::new(create_session().into_inner());
+        let scan = provider.scan(&session.state(), None, &[], None).await?;
+        let exec = scan.downcast_ref::<DeltaScanExec>().expect("DV scan");
+        assert!(!exec.selection_vectors.is_empty());
+        let predicate = session
+            .state()
+            .create_physical_expr(col("int").eq(lit(228)), &exec.schema().to_dfschema()?)?;
+        let column: Arc<dyn PhysicalExpr> =
+            Arc::new(Column::new("int", exec.schema().index_of("int")?));
+        let dynamic: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::clone(&predicate),
+        ));
+        for phase in [FilterPushdownPhase::Pre, FilterPushdownPhase::Post] {
+            let description = exec.gather_filters_for_pushdown(
+                phase,
+                vec![Arc::clone(&predicate), Arc::clone(&dynamic)],
+                session.state().config().options(),
+            )?;
+            assert!(
+                description
+                    .parent_filters()
+                    .iter()
+                    .flatten()
+                    .all(|filter| matches!(filter.discriminant, PushedDown::No)),
+                "a filter before the DV mask changes physical row positions"
+            );
+        }
         Ok(())
     }
 
