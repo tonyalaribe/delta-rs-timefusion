@@ -1051,6 +1051,7 @@ async fn test_conflict_for_remove_actions() -> Result<(), Box<dyn Error>> {
         &filter,
         None,
         None,
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -1119,6 +1120,7 @@ async fn test_no_conflict_for_append_actions() -> Result<(), Box<dyn Error>> {
         &filter,
         None,
         None,
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -1182,6 +1184,7 @@ async fn test_commit_interval() -> Result<(), Box<dyn Error>> {
         OptimizeType::Compact,
         dt.snapshot()?.snapshot(),
         &[],
+        None,
         None,
         None,
         WriterProperties::builder().build(),
