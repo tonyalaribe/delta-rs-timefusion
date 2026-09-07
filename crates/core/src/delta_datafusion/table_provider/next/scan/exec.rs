@@ -141,6 +141,11 @@ fn remap_ordering_to_schema(ordering: &LexOrdering, schema: &SchemaRef) -> Optio
 }
 
 impl DeltaScanExec {
+    fn requires_physical_row_order(&self) -> bool {
+        !self.selection_vectors.is_empty()
+            || self.scan_plan.contract.retained_row_index_field().is_some()
+    }
+
     pub(crate) fn new(
         scan_plan: Arc<KernelScanPlan>,
         input: Arc<dyn ExecutionPlan>,
@@ -294,8 +299,8 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.scan_plan.contract.retained_row_index_field().is_some() {
-            // Retained row indexes depend on one stream seeing each file's rows.
+        if self.requires_physical_row_order() {
+            // Positional deletion masks and row indexes need one stream per file.
             vec![Distribution::SinglePartition]
         } else {
             vec![Distribution::UnspecifiedDistribution]
@@ -330,9 +335,9 @@ impl ExecutionPlan for DeltaScanExec {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if self.scan_plan.contract.retained_row_index_field().is_some() {
-            // Each DeltaScanStream keeps row ordinal counters for one execution partition.
-            // Repartitioning can split one file across streams and break ordinal contiguity.
+        if self.requires_physical_row_order() {
+            // Each stream keeps positional mask offsets and row ordinal counters.
+            // Repartitioning a file across streams restarts those positions.
             return Ok(None);
         }
 
@@ -353,11 +358,11 @@ impl ExecutionPlan for DeltaScanExec {
     ) -> Result<SendableRecordBatchStream> {
         // Normal planning enforces this through EnforceDistribution. Keep this check for
         // callers that build DeltaScanExec directly or replace its child plan.
-        if self.scan_plan.contract.retained_row_index_field().is_some() {
+        if self.requires_physical_row_order() {
             let input_partition_count = self.input.properties().partitioning.partition_count();
             if input_partition_count > 1 {
                 return plan_err!(
-                    "DeltaScanExec retained row indexes require a single input partition, got {input_partition_count}"
+                    "DeltaScanExec positional masks or row indexes require a single input partition, got {input_partition_count}"
                 );
             }
         }
@@ -1702,44 +1707,54 @@ mod tests {
         config.options_mut().optimizer.repartition_file_min_size = 0;
         let session = datafusion::prelude::SessionContext::new_with_config(config);
         session.register_table("dv", Arc::new(provider))?;
-        let plan = session
-            .sql("SELECT letter, int, row_ordinal FROM dv")
-            .await?
-            .create_physical_plan()
-            .await?;
-        // Coalescing independently read byte ranges cannot recover physical row order.
-        let mut pending = vec![Arc::clone(&plan)];
-        let mut files = 0;
-        while let Some(node) = pending.pop() {
-            if let Some(source) =
-                node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
-                && let Some(scan) = source
-                    .data_source()
-                    .downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>(
-                )
-            {
-                for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
-                    assert!(
-                        file.range.is_none(),
-                        "positional masks require whole-file scans"
-                    );
-                    files += 1;
+        for (query, expected) in [
+            (
+                "SELECT letter, int FROM dv",
+                vec![
+                    "+--------+-----+",
+                    "| letter | int |",
+                    "+--------+-----+",
+                    "| b      | 228 |",
+                    "+--------+-----+",
+                ],
+            ),
+            (
+                "SELECT letter, int, row_ordinal FROM dv",
+                vec![
+                    "+--------+-----+-------------+",
+                    "| letter | int | row_ordinal |",
+                    "+--------+-----+-------------+",
+                    "| b      | 228 | 2           |",
+                    "+--------+-----+-------------+",
+                ],
+            ),
+        ] {
+            let plan = session.sql(query).await?.create_physical_plan().await?;
+            // Coalescing independently read byte ranges cannot recover physical row order.
+            let mut pending = vec![Arc::clone(&plan)];
+            let mut files = 0;
+            while let Some(node) = pending.pop() {
+                if let Some(source) =
+                    node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+                    && let Some(scan) = source
+                        .data_source()
+                        .downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>(
+                    )
+                {
+                    for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
+                        assert!(
+                            file.range.is_none(),
+                            "positional masks require whole-file scans"
+                        );
+                        files += 1;
+                    }
                 }
+                pending.extend(node.children().into_iter().cloned());
             }
-            pending.extend(node.children().into_iter().cloned());
+            assert!(files > 0, "must inspect the actual parquet scan");
+            let batches = collect(plan, session.task_ctx()).await?;
+            assert_batches_sorted_eq!(&expected, &batches);
         }
-        assert!(files > 0, "must inspect the actual parquet scan");
-        let batches = collect(plan, session.task_ctx()).await?;
-        assert_batches_sorted_eq!(
-            &[
-                "+--------+-----+-------------+",
-                "| letter | int | row_ordinal |",
-                "+--------+-----+-------------+",
-                "| b      | 228 | 2           |",
-                "+--------+-----+-------------+",
-            ],
-            &batches
-        );
         Ok(())
     }
 
@@ -2047,7 +2062,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("retained row indexes require a single input partition"),
+                .contains("positional masks or row indexes require a single input partition"),
             "unexpected error: {err}"
         );
 
