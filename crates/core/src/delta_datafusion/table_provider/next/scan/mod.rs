@@ -489,7 +489,10 @@ async fn get_data_scan_plan(
         &file_id_field,
         predicate,
         row_ordinal_selections,
-        scan_plan.contract.retain_row_index,
+        // DV keep-masks live in `dvs` here, NOT in the per-file Option (which this
+        // path always leaves None) — consult the map or the whole-file requirement
+        // is silently vacuous and DV'd files get byte-range split.
+        scan_plan.contract.retain_row_index || !dvs.is_empty(),
     )
     .await?;
 
@@ -680,7 +683,9 @@ async fn get_read_plan(
     // files get a `ParquetAccessPlan` attached so the parquet opener skips non-selected row
     // groups/rows; all other files (and any fallback case) scan fully.
     row_ordinal_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
-    retain_row_index: bool,
+    // Force whole-file scans (no byte-range splitting): required when row ordinals are
+    // retained OR any DV keep-mask applies, since both are positional per file.
+    force_whole_file_scans: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut plans = Vec::new();
 
@@ -726,7 +731,8 @@ async fn get_read_plan(
             TableSchema::new(parquet_read_schema.clone(), vec![file_id_field.clone()]);
         let full_table_schema = table_schema.table_schema().clone();
         // Positional masks and row ordinals require physical file order.
-        let allow_repartitioning = !retain_row_index && files.iter().all(|(_, dv)| dv.is_none());
+        let allow_repartitioning =
+            !force_whole_file_scans && files.iter().all(|(_, dv)| dv.is_none());
         let mut file_source = ParquetSource::new(table_schema)
             .with_repartitioning(allow_repartitioning)
             .with_table_parquet_options(pq_options.clone())

@@ -307,6 +307,17 @@ impl ExecutionPlan for DeltaScanExec {
     //     vec![true]
     // }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // DV keep-masks and row ordinals are consumed positionally per file, so a
+        // RoundRobinBatch inserted below this exec (EnforceDistribution's fallback
+        // when the source refuses byte-range splits) would spray one file's batches
+        // across mask-cursor streams. Whole-file groups may still run in parallel.
+        vec![
+            self.selection_vectors.is_empty()
+                && self.scan_plan.contract.retained_row_index_field().is_none(),
+        ]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -330,9 +341,12 @@ impl ExecutionPlan for DeltaScanExec {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if self.scan_plan.contract.retained_row_index_field().is_some() {
-            // Each DeltaScanStream keeps row ordinal counters for one execution partition.
-            // Repartitioning can split one file across streams and break ordinal contiguity.
+        if self.scan_plan.contract.retained_row_index_field().is_some()
+            || !self.selection_vectors.is_empty()
+        {
+            // Each DeltaScanStream keeps row ordinal counters and DV mask cursors for one
+            // execution partition. Repartitioning can split one file across streams and
+            // break ordinal/mask contiguity.
             return Ok(None);
         }
 
@@ -1737,6 +1751,71 @@ mod tests {
                 "+--------+-----+-------------+",
                 "| b      | 228 | 2           |",
                 "+--------+-----+-------------+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
+    /// Same as above but WITHOUT projecting the row-index column — the shape of a
+    /// COUNT(*) oracle over a DV'd file. `get_data_scan_plan` keeps masks in the
+    /// `dvs` map (its per-file Option is always None), so the whole-file requirement
+    /// must key on the map or DV'd files get byte-range split / round-robin'd and
+    /// the positional mask cursors scramble.
+    #[tokio::test]
+    async fn test_dv_masks_survive_optimizer_file_splitting_without_row_index() -> TestResult {
+        let mut table = open_fs_path(DV_TABLE_PATH);
+        table.load().await?;
+        let provider = table.table_provider().await?;
+        let mut config = datafusion::prelude::SessionConfig::new()
+            .with_batch_size(1)
+            .with_target_partitions(4);
+        config.options_mut().optimizer.repartition_file_min_size = 0;
+        let session = datafusion::prelude::SessionContext::new_with_config(config);
+        session.register_table("dv", provider)?;
+        let plan = session
+            .sql("SELECT letter, int FROM dv")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let mut pending = vec![(Arc::clone(&plan), false)];
+        let mut files = 0;
+        while let Some((node, below_delta_scan)) = pending.pop() {
+            if let Some(source) =
+                node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+                && let Some(scan) = source
+                    .data_source()
+                    .downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>(
+                )
+            {
+                for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
+                    assert!(
+                        file.range.is_none(),
+                        "positional masks require whole-file scans"
+                    );
+                    files += 1;
+                }
+            }
+            // A repartition between the parquet source and the mask application
+            // sprays one file's batches across mask-cursor streams.
+            if below_delta_scan {
+                assert!(
+                    node.name() != "RepartitionExec",
+                    "no repartitioning may sit below DeltaScanExec"
+                );
+            }
+            let below = below_delta_scan || node.name() == "DeltaScanExec";
+            pending.extend(node.children().into_iter().cloned().map(|c| (c, below)));
+        }
+        assert!(files > 0, "must inspect the actual parquet scan");
+        let batches = collect(plan, session.task_ctx()).await?;
+        assert_batches_sorted_eq!(
+            &[
+                "+--------+-----+",
+                "| letter | int |",
+                "+--------+-----+",
+                "| b      | 228 |",
+                "+--------+-----+",
             ],
             &batches
         );
