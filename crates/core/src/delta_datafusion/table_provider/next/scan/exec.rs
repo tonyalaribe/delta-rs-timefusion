@@ -2030,6 +2030,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_positional_scan_keeps_ordered_merge_and_file_positions() -> TestResult {
+        use arrow::array::Int32Array;
+        use arrow::compute::SortOptions;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
+        use datafusion::physical_plan::{collect, displayable};
+
+        for (with_dv, with_row_index) in [(true, false), (false, true), (true, true)] {
+            let (_, mut scan_plan) = int32_scan_plan().await?;
+            if with_row_index {
+                scan_plan = retain_row_index(scan_plan, "row_ordinal");
+            }
+            let a = value_and_file_id_batch(&[40, 20], &[Some("f1"), Some("f1")], false)?;
+            let b = value_and_file_id_batch(&[30, 10], &[Some("f2"), Some("f2")], false)?;
+            let order = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(Column::new("value", 0)),
+                SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            )])
+            .expect("ordering");
+            let source =
+                MemorySourceConfig::try_new(&[vec![a.clone()], vec![b]], a.schema(), None)?
+                    .try_with_sort_information(vec![order])?;
+            let masks = if with_dv {
+                selection_vectors_f1_f2()
+            } else {
+                Arc::new(DashMap::new())
+            };
+            let scan = Arc::new(DeltaScanExec::new(
+                scan_plan,
+                Arc::new(DataSourceExec::new(Arc::new(source))),
+                Arc::new(HashMap::new()),
+                masks,
+                Arc::new(super::super::PublicFileIdMap::default()),
+                HashMap::new(),
+                ExecutionPlanMetricsSet::new(),
+            ));
+            let plan = EnforceDistribution::new().optimize(scan, &ConfigOptions::default())?;
+            let formatted = displayable(plan.as_ref()).indent(true).to_string();
+            assert!(
+                formatted.contains("SortPreservingMergeExec"),
+                "ordered scan lost its merge: {formatted}"
+            );
+            assert!(
+                !formatted.contains("CoalescePartitionsExec"),
+                "unordered coalesce: {formatted}"
+            );
+            let session = create_session().into_inner();
+            let batches = collect(plan, session.task_ctx()).await?;
+            let values: Vec<i32> = batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("values")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(
+                values,
+                if with_dv {
+                    vec![40, 10]
+                } else {
+                    vec![40, 30, 20, 10]
+                }
+            );
+            if with_row_index {
+                let ordinals: Vec<u64> = batches
+                    .iter()
+                    .flat_map(|b| row_ordinals(b, "row_ordinal"))
+                    .collect();
+                assert_eq!(
+                    ordinals,
+                    if with_dv {
+                        vec![1, 2]
+                    } else {
+                        vec![1, 1, 2, 2]
+                    }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_retained_row_index_execute_rejects_multi_partition_child() -> TestResult {
         let (_kernel_type, scan_plan) = int32_scan_plan().await?;
         let table = TestTables::Simple.table_builder()?.load().await?;
