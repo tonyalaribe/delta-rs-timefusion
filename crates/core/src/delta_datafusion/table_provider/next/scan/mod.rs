@@ -805,6 +805,9 @@ async fn get_read_plan(
             parquet_read_schema.clone(),
         )
         .await;
+        let footer_ordering = derived_ordering
+            .as_ref()
+            .map(|(ordering, _, _)| ordering.clone());
 
         // A declared ordering only survives DataFusion's stats-based per-group validation
         // (`FileScanConfig::validated_output_ordering`) if every file carries min/max stats
@@ -877,9 +880,19 @@ async fn get_read_plan(
                 .with_limit(limit)
                 .with_expr_adapter(Some(adapter_factory.clone() as _));
         if let Some(ordering) = output_ordering {
+            // Keep the complete footer claim as a candidate too: single-file groups
+            // validate it without bounds on secondary columns. Multi-file groups still
+            // have to pass DataFusion's validation, with the stats-backed prefix as
+            // a fallback when the complete key cannot be proved across files.
+            let mut orderings = vec![ordering];
+            if let Some(footer_ordering) = footer_ordering
+                && footer_ordering != orderings[0]
+            {
+                orderings.insert(0, footer_ordering);
+            }
             // Auto-enables `preserve_order`: DataFusion keeps each file group's order and
             // merges groups with a SortPreservingMergeExec instead of concatenating.
-            config = config.with_output_ordering(vec![ordering]);
+            config = config.with_output_ordering(orderings);
         }
 
         plans.push(DataSourceExec::from_data_source(config.build()) as Arc<dyn ExecutionPlan>);
