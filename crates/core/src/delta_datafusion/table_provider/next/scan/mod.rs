@@ -1086,10 +1086,12 @@ async fn derive_common_ordering(
                     ordering
                         .as_ref()
                         .zip(meta.as_ref())
-                        .and_then(|(ordering, meta)| {
+                        .map(|(ordering, meta)| {
                             ordering
                                 .iter()
-                                .map(|expr| {
+                                // Missing bounds for one column must not discard usable
+                                // leading bounds. The prefix check below remains conservative.
+                                .filter_map(|expr| {
                                     let column = expr.expr.downcast_ref::<Column>()?.index();
                                     sort_column_footer_stats(meta, &read_schema, column)
                                         .map(|stats| (column, stats))
