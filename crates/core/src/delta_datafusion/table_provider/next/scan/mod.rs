@@ -805,6 +805,9 @@ async fn get_read_plan(
             parquet_read_schema.clone(),
         )
         .await;
+        let footer_ordering = derived_ordering
+            .as_ref()
+            .map(|(ordering, _, _)| ordering.clone());
 
         // A declared ordering only survives DataFusion's stats-based per-group validation
         // (`FileScanConfig::validated_output_ordering`) if every file carries min/max stats
@@ -877,9 +880,19 @@ async fn get_read_plan(
                 .with_limit(limit)
                 .with_expr_adapter(Some(adapter_factory.clone() as _));
         if let Some(ordering) = output_ordering {
+            // Keep the complete footer claim as a candidate too: single-file groups
+            // validate it without bounds on secondary columns. Multi-file groups still
+            // have to pass DataFusion's validation, with the stats-backed prefix as
+            // a fallback when the complete key cannot be proved across files.
+            let mut orderings = vec![ordering];
+            if let Some(footer_ordering) = footer_ordering
+                && footer_ordering != orderings[0]
+            {
+                orderings.insert(0, footer_ordering);
+            }
             // Auto-enables `preserve_order`: DataFusion keeps each file group's order and
             // merges groups with a SortPreservingMergeExec instead of concatenating.
-            config = config.with_output_ordering(vec![ordering]);
+            config = config.with_output_ordering(orderings);
         }
 
         plans.push(DataSourceExec::from_data_source(config.build()) as Arc<dyn ExecutionPlan>);
@@ -1086,10 +1099,12 @@ async fn derive_common_ordering(
                     ordering
                         .as_ref()
                         .zip(meta.as_ref())
-                        .and_then(|(ordering, meta)| {
+                        .map(|(ordering, meta)| {
                             ordering
                                 .iter()
-                                .map(|expr| {
+                                // Missing bounds for one column must not discard usable
+                                // leading bounds. The prefix check below remains conservative.
+                                .filter_map(|expr| {
                                     let column = expr.expr.downcast_ref::<Column>()?.index();
                                     sort_column_footer_stats(meta, &read_schema, column)
                                         .map(|stats| (column, stats))
@@ -1933,6 +1948,64 @@ mod tests {
             repacked.output_ordering().is_some(),
             "repacked groups must keep the declared ordering through validation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_null_secondary_sort_column_retains_leading_footer_stats() -> TestResult {
+        use parquet::file::{metadata::SortingColumn, properties::WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![20, 10])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+            ],
+        )?;
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(Some(vec![
+                SortingColumn {
+                    column_idx: 0,
+                    descending: true,
+                    nulls_first: false,
+                },
+                SortingColumn {
+                    column_idx: 1,
+                    descending: false,
+                    nulls_first: false,
+                },
+            ]))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("null-secondary.parquet");
+        store.put(&path, buffer.into()).await?;
+        let mut files = vec![(store.head(&path).await?.into(), None)];
+        let session = create_session().into_inner();
+        let (ordering, stats, _) = derive_common_ordering(
+            store,
+            session
+                .runtime_env()
+                .cache_manager
+                .get_file_metadata_cache(),
+            &files,
+            schema.clone(),
+        )
+        .await
+        .expect("sorted footer");
+        apply_footer_sort_stats(&mut files, stats, &schema);
+        assert_eq!(
+            stats_backed_prefix_len(&files, &ordering),
+            1,
+            "missing secondary bounds must not erase valid leading bounds"
+        );
+        Ok(())
     }
 
     #[test]
