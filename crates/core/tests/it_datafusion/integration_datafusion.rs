@@ -2528,8 +2528,9 @@ mod insert_into_tests {
             .collect()
             .await?;
 
-        assert_eq!(all_data.len(), 1);
-        let data_batch = &all_data[0];
+        // Ordered results may span batches when an ordered merge streams the
+        // files. Check the complete result independently of batch boundaries.
+        let data_batch = arrow::compute::concat_batches(&all_data[0].schema(), &all_data)?;
         assert_eq!(data_batch.num_rows(), 6); // 2 initial + 4 appended = 6 total
 
         let names_col = data_batch.column_by_name("name").unwrap();

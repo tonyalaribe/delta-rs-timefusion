@@ -307,10 +307,20 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
-    // TODO: setting this will fail certain tests, but why
-    // fn maintains_input_order(&self) -> Vec<bool> {
-    //     vec![true]
-    // }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // The stream emits contiguous file runs in input order. Projection,
+        // transforms, and deletion masks preserve the relative order of rows.
+        // Keep ordered merges when enforcing the single-partition contract;
+        // an unordered coalesce would discard the Parquet scan's ordering.
+        vec![true]
+    }
+
+    fn supports_sort_pushdown(&self) -> bool {
+        // Physical masks and row ordinals depend on the reader's row sequence.
+        // Keeping an existing ordering is safe; inserting a new sort below
+        // this boundary can change which rows are visible.
+        false
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -2026,6 +2036,154 @@ mod tests {
             "unexpected distribution: {distribution:?}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_positional_scan_keeps_ordered_merge_and_file_positions() -> TestResult {
+        use arrow::array::Int32Array;
+        use arrow::compute::SortOptions;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
+        use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+        use datafusion::physical_plan::{collect, displayable};
+
+        for (with_dv, with_row_index, prefer_existing_sort, ordered_input, repartition_sorts) in
+            [(true, false), (false, true), (true, true)]
+                .into_iter()
+                .flat_map(|(dv, index)| [false, true].map(|prefer| (dv, index, prefer)))
+                .flat_map(|(dv, index, prefer)| {
+                    [false, true].into_iter().flat_map(move |ordered| {
+                        [false, true].map(|repartition| (dv, index, prefer, ordered, repartition))
+                    })
+                })
+        {
+            let (_, mut scan_plan) = int32_scan_plan().await?;
+            if with_row_index {
+                scan_plan = retain_row_index(scan_plan, "row_ordinal");
+            }
+            let a = value_and_file_id_batch(&[40, 20], &[Some("f1"), Some("f1")], false)?;
+            let b = value_and_file_id_batch(&[30, 10], &[Some("f2"), Some("f2")], false)?;
+            let order = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(Column::new("value", 0)),
+                SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            )])
+            .expect("ordering");
+            let source =
+                MemorySourceConfig::try_new(&[vec![a.clone()], vec![b]], a.schema(), None)?;
+            let source = if ordered_input {
+                source.try_with_sort_information(vec![order])?
+            } else {
+                source
+            };
+            let masks = if with_dv {
+                selection_vectors_f1_f2()
+            } else {
+                Arc::new(DashMap::new())
+            };
+            let scan = Arc::new(DeltaScanExec::new(
+                scan_plan,
+                Arc::new(DataSourceExec::new(Arc::new(source))),
+                Arc::new(HashMap::new()),
+                masks,
+                Arc::new(super::super::PublicFileIdMap::default()),
+                HashMap::new(),
+                ExecutionPlanMetricsSet::new(),
+            ));
+            let mut config = ConfigOptions::default();
+            config.optimizer.prefer_existing_sort = prefer_existing_sort;
+            config.optimizer.repartition_sorts = repartition_sorts;
+            let plan = EnforceDistribution::new().optimize(scan, &config)?;
+            let plan = EnforceSorting::new().optimize(plan, &config)?;
+            let formatted = displayable(plan.as_ref()).indent(true).to_string();
+            assert_eq!(
+                formatted.contains("SortPreservingMergeExec"),
+                ordered_input,
+                "unexpected merge: {formatted}"
+            );
+            assert_eq!(
+                formatted.contains("CoalescePartitionsExec"),
+                !ordered_input,
+                "unexpected coalesce: {formatted}"
+            );
+            let session = create_session().into_inner();
+            let batches = collect(Arc::clone(&plan), session.task_ctx()).await?;
+            let values: Vec<i32> = batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("values")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            let mut descending_values = values.clone();
+            if !ordered_input {
+                descending_values.sort_unstable_by(|a, b| b.cmp(a));
+            }
+            assert_eq!(
+                descending_values,
+                if with_dv {
+                    vec![40, 10]
+                } else {
+                    vec![40, 30, 20, 10]
+                }
+            );
+            // A caller may request the opposite order. Sorting must happen
+            // after physical masks and ordinals have been applied.
+            let ascending = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(Column::new("value", 0)),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )])
+            .unwrap();
+            let sorted = Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(
+                ascending, plan,
+            ));
+            let sorted = EnforceSorting::new().optimize(sorted, &config)?;
+            let reversed = collect(sorted, session.task_ctx()).await?;
+            let reversed_values: Vec<i32> = reversed
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            let mut expected = values.clone();
+            expected.sort_unstable();
+            assert_eq!(reversed_values, expected, "outer sort changed visible rows");
+            if with_row_index {
+                // Ordinals must remain attached to their physical rows even
+                // when unordered partitions arrive in either order, or a caller sorts.
+                for result in [&batches, &reversed] {
+                    for batch in result {
+                        let values = batch
+                            .column(0)
+                            .as_primitive::<arrow::datatypes::Int32Type>();
+                        let expected: Vec<u64> = values
+                            .values()
+                            .iter()
+                            .map(|value| if *value >= 30 { 1 } else { 2 })
+                            .collect();
+                        assert_eq!(row_ordinals(batch, "row_ordinal"), expected);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

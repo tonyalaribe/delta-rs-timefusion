@@ -37,10 +37,7 @@ use datafusion::{
     config::TableParquetOptions,
     datasource::physical_plan::{
         ParquetSource,
-        parquet::{
-            ParquetAccessPlan, RowGroupAccess,
-            metadata::DFParquetMetadata,
-        },
+        parquet::{ParquetAccessPlan, RowGroupAccess, metadata::DFParquetMetadata},
     },
     error::DataFusionError,
     execution::{cache::cache_manager::FileMetadataCache, object_store::ObjectStoreUrl},
@@ -748,7 +745,8 @@ async fn get_read_plan(
             // remains in DataFusion's post-scan Filter (pushdown is Inexact), so
             // dropping a term here is purely a lost optimization, never a
             // correctness change.
-            match adapter_factory.create(parquet_predicate_schema.clone(), full_read_schema.clone()) {
+            match adapter_factory.create(parquet_predicate_schema.clone(), full_read_schema.clone())
+            {
                 Ok(adapter) => {
                     let rewritten = datafusion::logical_expr::utils::split_conjunction(pred)
                         .into_iter()
@@ -774,7 +772,8 @@ async fn get_read_plan(
                         });
                     match rewritten {
                         Some(expr) => {
-                            file_source = file_source.with_predicate(expr).with_pushdown_filters(true);
+                            file_source =
+                                file_source.with_predicate(expr).with_pushdown_filters(true);
                         }
                         None => debug!(
                             predicate = ?pred,
@@ -860,9 +859,12 @@ async fn get_read_plan(
         // key). Repack so the declared ordering survives; without a declared ordering keep
         // the grouping exactly as-is.
         let file_groups = match &output_ordering {
-            Some(ordering) if regroup => {
-                regroup_for_declared_ordering(file_groups, ordering, &full_table_schema, state.config().target_partitions())
-            }
+            Some(ordering) if regroup => regroup_for_declared_ordering(
+                file_groups,
+                ordering,
+                &full_table_schema,
+                state.config().target_partitions(),
+            ),
             _ => file_groups,
         };
         let (file_groups, statistics) =
@@ -1000,9 +1002,7 @@ fn ordering_from_footer_prefix(
 /// length — and `[timestamp]` alone is what bounded dedup and the streaming top-N need.
 /// Files sharing no lead column agree on nothing and stay isolated, which is the case
 /// isolation exists for.
-fn agreed_ordering_prefix(
-    per_file: &[Option<LexOrdering>],
-) -> Option<(LexOrdering, Vec<bool>)> {
+fn agreed_ordering_prefix(per_file: &[Option<LexOrdering>]) -> Option<(LexOrdering, Vec<bool>)> {
     let mut tally: Vec<(&LexOrdering, usize)> = Vec::new();
     for ordering in per_file.iter().flatten() {
         match tally
@@ -1836,24 +1836,36 @@ mod tests {
             &ts_schema(),
             4,
         );
-        assert!(widened.len() > packed.len(), "a higher target must fan out, got {} group(s)", widened.len());
-        assert_eq!(widened.iter().map(FileGroup::len).sum::<usize>(), files.len(), "no file lost or duplicated");
+        assert!(
+            widened.len() > packed.len(),
+            "a higher target must fan out, got {} group(s)",
+            widened.len()
+        );
+        assert_eq!(
+            widened.iter().map(FileGroup::len).sum::<usize>(),
+            files.len(),
+            "no file lost or duplicated"
+        );
 
         // Never NARROW: a target below the incoming grouping would merge files
         // back together, and a group is only valid while its files stay
         // non-overlapping in the sort key.
         let overlapping = vec![ordered_file("x", 0, 100), ordered_file("y", 50, 150)];
         let incoming = partitioned_files_to_file_groups(overlapping);
-        let forced = regroup_for_declared_ordering(incoming.clone(), &ts_ordering(false), &ts_schema(), 1);
-        assert!(forced.len() >= incoming.len(), "overlapping files must not be merged by a low target");
+        let forced =
+            regroup_for_declared_ordering(incoming.clone(), &ts_ordering(false), &ts_schema(), 1);
+        assert!(
+            forced.len() >= incoming.len(),
+            "overlapping files must not be merged by a low target"
+        );
     }
 
     #[test]
-    fn test_stats_backed_prefix_len_stops_at_first_statless_sort_column() {
+    fn test_stats_backed_prefix_len_stops_at_first_column_without_stats() {
         use arrow_schema::SortOptions;
         use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
 
-        // Two sort columns; only the lead one (ts) has min/max stats — the MOR reality where
+        // Two sort columns; only the lead one (ts) has min/max stats — the merge-on-read case where
         // the tiebreak id is not a predicate column so Delta never materializes its stats.
         let ordering = LexOrdering::new([
             PhysicalSortExpr::new(
@@ -2926,8 +2938,9 @@ mod tests {
         let path = Path::from("test_mixed_conjunction.parquet");
         store.put(&path, buffer.into()).await?;
         let mut file: PartitionedFile = store.head(&path).await?.into();
-        file.partition_values
-            .push(wrap_file_id_value("memory:///test_mixed_conjunction.parquet"));
+        file.partition_values.push(wrap_file_id_value(
+            "memory:///test_mixed_conjunction.parquet",
+        ));
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
