@@ -315,6 +315,13 @@ impl ExecutionPlan for DeltaScanExec {
         vec![true]
     }
 
+    fn supports_sort_pushdown(&self) -> bool {
+        // Physical masks and row ordinals depend on the reader's row sequence.
+        // Keeping an existing ordering is safe; inserting a new sort below
+        // this boundary can change which rows are visible.
+        false
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2043,10 +2050,15 @@ mod tests {
         use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
         use datafusion::physical_plan::{collect, displayable};
 
-        for (with_dv, with_row_index, prefer_existing_sort) in
+        for (with_dv, with_row_index, prefer_existing_sort, ordered_input, repartition_sorts) in
             [(true, false), (false, true), (true, true)]
                 .into_iter()
                 .flat_map(|(dv, index)| [false, true].map(|prefer| (dv, index, prefer)))
+                .flat_map(|(dv, index, prefer)| {
+                    [false, true].into_iter().flat_map(move |ordered| {
+                        [false, true].map(|repartition| (dv, index, prefer, ordered, repartition))
+                    })
+                })
         {
             let (_, mut scan_plan) = int32_scan_plan().await?;
             if with_row_index {
@@ -2063,8 +2075,12 @@ mod tests {
             )])
             .expect("ordering");
             let source =
-                MemorySourceConfig::try_new(&[vec![a.clone()], vec![b]], a.schema(), None)?
-                    .try_with_sort_information(vec![order])?;
+                MemorySourceConfig::try_new(&[vec![a.clone()], vec![b]], a.schema(), None)?;
+            let source = if ordered_input {
+                source.try_with_sort_information(vec![order])?
+            } else {
+                source
+            };
             let masks = if with_dv {
                 selection_vectors_f1_f2()
             } else {
@@ -2081,16 +2097,19 @@ mod tests {
             ));
             let mut config = ConfigOptions::default();
             config.optimizer.prefer_existing_sort = prefer_existing_sort;
+            config.optimizer.repartition_sorts = repartition_sorts;
             let plan = EnforceDistribution::new().optimize(scan, &config)?;
             let plan = EnforceSorting::new().optimize(plan, &config)?;
             let formatted = displayable(plan.as_ref()).indent(true).to_string();
-            assert!(
+            assert_eq!(
                 formatted.contains("SortPreservingMergeExec"),
-                "ordered scan lost its merge: {formatted}"
+                ordered_input,
+                "unexpected merge: {formatted}"
             );
-            assert!(
-                !formatted.contains("CoalescePartitionsExec"),
-                "unordered coalesce: {formatted}"
+            assert_eq!(
+                formatted.contains("CoalescePartitionsExec"),
+                !ordered_input,
+                "unexpected coalesce: {formatted}"
             );
             let session = create_session().into_inner();
             let batches = collect(Arc::clone(&plan), session.task_ctx()).await?;
@@ -2105,8 +2124,12 @@ mod tests {
                         .to_vec()
                 })
                 .collect();
+            let mut descending_values = values.clone();
+            if !ordered_input {
+                descending_values.sort_unstable_by(|a, b| b.cmp(a));
+            }
             assert_eq!(
-                values,
+                descending_values,
                 if with_dv {
                     vec![40, 10]
                 } else {
@@ -2141,21 +2164,24 @@ mod tests {
                 })
                 .collect();
             let mut expected = values.clone();
-            expected.reverse();
+            expected.sort_unstable();
             assert_eq!(reversed_values, expected, "outer sort changed visible rows");
             if with_row_index {
-                let ordinals: Vec<u64> = batches
-                    .iter()
-                    .flat_map(|b| row_ordinals(b, "row_ordinal"))
-                    .collect();
-                assert_eq!(
-                    ordinals,
-                    if with_dv {
-                        vec![1, 2]
-                    } else {
-                        vec![1, 1, 2, 2]
+                // Ordinals must remain attached to their physical rows even
+                // when unordered partitions arrive in either order, or a caller sorts.
+                for result in [&batches, &reversed] {
+                    for batch in result {
+                        let values = batch
+                            .column(0)
+                            .as_primitive::<arrow::datatypes::Int32Type>();
+                        let expected: Vec<u64> = values
+                            .values()
+                            .iter()
+                            .map(|value| if *value >= 30 { 1 } else { 2 })
+                            .collect();
+                        assert_eq!(row_ordinals(batch, "row_ordinal"), expected);
                     }
-                );
+                }
             }
         }
         Ok(())
