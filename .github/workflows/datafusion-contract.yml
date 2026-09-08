@@ -41,6 +41,6 @@ jobs:
       - name: Required Clippy checks
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Ordering optimizer regressions
-        run: cargo test -p datafusion --test core physical_optimizer::enforce_sorting
+        run: cargo test -p datafusion --test core_integration physical_optimizer::enforce_sorting
       - name: Contributor lint suite
         run: ./dev/rust_lint.sh
