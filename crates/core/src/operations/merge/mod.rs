@@ -2306,11 +2306,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_target_row_ordinal_scan_plan_coalesces_multiple_files() {
+    async fn test_target_row_ordinal_scan_preserves_files_when_repartitioning_requested() {
         let schema = get_arrow_schema(&None);
         let mut table = setup_table(None).await;
         // Positional row indexes forbid splitting one physical file. Exercise
-        // partition coalescing with independent files instead.
+        // the physical ordinal contract across independent files instead.
         for _ in 0..4 {
             table = write_data(table, &schema).await;
         }
@@ -2341,7 +2341,51 @@ mod tests {
             .create_physical_plan(&target)
             .await
             .expect("physical plan builds");
-        assert_retained_row_index_scan_coalesces_partitioned_child(&physical, 4);
+        assert_retained_row_index_scan_has_single_partition_child(&physical);
+        let batches = collect(physical, state.task_ctx()).await.unwrap();
+        let mut by_file: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+        for batch in batches {
+            let files = arrow::compute::cast(
+                batch.column_by_name(PATH_COLUMN).unwrap(),
+                &ArrowDataType::Utf8,
+            )
+            .unwrap();
+            let files = files
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let ids =
+                arrow::compute::cast(batch.column_by_name("id").unwrap(), &ArrowDataType::Utf8)
+                    .unwrap();
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let ordinals = batch
+                .column_by_name(TARGET_ROW_ORDINAL_IN_FILE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                by_file
+                    .entry(files.value(row).to_owned())
+                    .or_default()
+                    .push((ids.value(row).to_owned(), ordinals.value(row)));
+            }
+        }
+        assert_eq!(by_file.len(), 4);
+        for rows in by_file.values() {
+            assert_eq!(
+                rows,
+                &vec![
+                    ("A".into(), 1),
+                    ("B".into(), 2),
+                    ("C".into(), 3),
+                    ("D".into(), 4)
+                ]
+            );
+        }
     }
 
     #[tokio::test]
@@ -2485,35 +2529,6 @@ mod tests {
             child.properties().partitioning.partition_count(),
             1,
             "retained row-index DeltaScanExec must receive a single-partition child: {}",
-            displayable(plan.as_ref()).indent(true)
-        );
-    }
-
-    fn assert_retained_row_index_scan_coalesces_partitioned_child(
-        plan: &Arc<dyn ExecutionPlan>,
-        expected_partition_count: usize,
-    ) {
-        let child = retained_row_index_delta_scan_child(plan);
-        assert_eq!(
-            child.name(),
-            "CoalescePartitionsExec",
-            "retained row-index DeltaScanExec should coalesce partitioned input: {}",
-            displayable(plan.as_ref()).indent(true)
-        );
-
-        let coalesce_children = child.children();
-        assert_eq!(
-            coalesce_children.len(),
-            1,
-            "CoalescePartitionsExec should have one child"
-        );
-        assert_eq!(
-            coalesce_children[0]
-                .properties()
-                .partitioning
-                .partition_count(),
-            expected_partition_count,
-            "expected retained row-index scan to coalesce a partitioned child: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
