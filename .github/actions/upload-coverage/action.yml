@@ -1,12 +1,14 @@
 name: Upload to codecov
 inputs:
   token:
-    required: true
-    type: string
+    description: Codecov upload token; without one, retain the report as a workflow artifact.
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
     - name: Upload coverage to Codecov
+      if: inputs.token != ''
       # https://github.com/codecov/codecov-action/releases/tag/v7.0.0>
       uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f
       with:
@@ -14,3 +16,11 @@ runs:
         fail_ci_if_error: true
       env:
         CODECOV_TOKEN: ${{ inputs.token }}
+
+    - name: Retain coverage report without a Codecov token
+      if: inputs.token == ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: coverage-${{ github.job }}-${{ strategy.job-index }}
+        path: codecov.json
+        if-no-files-found: error

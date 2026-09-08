@@ -2093,7 +2093,7 @@ mod tests {
                 "unordered coalesce: {formatted}"
             );
             let session = create_session().into_inner();
-            let batches = collect(plan, session.task_ctx()).await?;
+            let batches = collect(Arc::clone(&plan), session.task_ctx()).await?;
             let values: Vec<i32> = batches
                 .iter()
                 .flat_map(|b| {
@@ -2113,6 +2113,36 @@ mod tests {
                     vec![40, 30, 20, 10]
                 }
             );
+            // A caller may request the opposite order. Sorting must happen
+            // after physical masks and ordinals have been applied.
+            let ascending = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(Column::new("value", 0)),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )])
+            .unwrap();
+            let sorted = Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(
+                ascending, plan,
+            ));
+            let sorted = EnforceSorting::new().optimize(sorted, &config)?;
+            let reversed = collect(sorted, session.task_ctx()).await?;
+            let reversed_values: Vec<i32> = reversed
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            let mut expected = values.clone();
+            expected.reverse();
+            assert_eq!(reversed_values, expected, "outer sort changed visible rows");
             if with_row_index {
                 let ordinals: Vec<u64> = batches
                     .iter()
