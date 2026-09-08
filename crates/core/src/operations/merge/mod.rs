@@ -2306,10 +2306,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_target_row_ordinal_scan_plan_coalesces_repartitioned_input() {
+    async fn test_target_row_ordinal_scan_plan_coalesces_multiple_files() {
         let schema = get_arrow_schema(&None);
-        let table = setup_table(None).await;
-        let table = write_data(table, &schema).await;
+        let mut table = setup_table(None).await;
+        // Positional row indexes forbid splitting one physical file. Exercise
+        // partition coalescing with independent files instead.
+        for _ in 0..4 {
+            table = write_data(table, &schema).await;
+        }
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 4);
         let config = SessionConfig::new()
             .with_batch_size(2)
             .with_target_partitions(4)

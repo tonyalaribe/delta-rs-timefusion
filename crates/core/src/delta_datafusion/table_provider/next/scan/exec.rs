@@ -307,10 +307,13 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
-    // TODO: setting this will fail certain tests, but why
-    // fn maintains_input_order(&self) -> Vec<bool> {
-    //     vec![true]
-    // }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // The stream emits contiguous file runs in input order. Projection,
+        // transforms, and deletion masks preserve the relative order of rows.
+        // Keep ordered merges when enforcing the single-partition contract;
+        // an unordered coalesce would discard the Parquet scan's ordering.
+        vec![true]
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -2037,9 +2040,14 @@ mod tests {
         use datafusion::datasource::source::DataSourceExec;
         use datafusion::physical_optimizer::PhysicalOptimizerRule;
         use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
+        use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
         use datafusion::physical_plan::{collect, displayable};
 
-        for (with_dv, with_row_index) in [(true, false), (false, true), (true, true)] {
+        for (with_dv, with_row_index, prefer_existing_sort) in
+            [(true, false), (false, true), (true, true)]
+                .into_iter()
+                .flat_map(|(dv, index)| [false, true].map(|prefer| (dv, index, prefer)))
+        {
             let (_, mut scan_plan) = int32_scan_plan().await?;
             if with_row_index {
                 scan_plan = retain_row_index(scan_plan, "row_ordinal");
@@ -2071,7 +2079,10 @@ mod tests {
                 HashMap::new(),
                 ExecutionPlanMetricsSet::new(),
             ));
-            let plan = EnforceDistribution::new().optimize(scan, &ConfigOptions::default())?;
+            let mut config = ConfigOptions::default();
+            config.optimizer.prefer_existing_sort = prefer_existing_sort;
+            let plan = EnforceDistribution::new().optimize(scan, &config)?;
+            let plan = EnforceSorting::new().optimize(plan, &config)?;
             let formatted = displayable(plan.as_ref()).indent(true).to_string();
             assert!(
                 formatted.contains("SortPreservingMergeExec"),
