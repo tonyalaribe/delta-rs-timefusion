@@ -1,0 +1,120 @@
+diff --git a/datafusion/core/tests/physical_optimizer/enforce_sorting.rs b/datafusion/core/tests/physical_optimizer/enforce_sorting.rs
+index 40bcdbbd6..4675efe6b 100644
+--- a/datafusion/core/tests/physical_optimizer/enforce_sorting.rs
++++ b/datafusion/core/tests/physical_optimizer/enforce_sorting.rs
+@@ -2452,6 +2452,24 @@ async fn test_replace_with_partial_sort2() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn test_order_preservation_does_not_require_sort_pushdown() -> Result<()> {
++    let schema = create_test_schema3()?;
++    let input = RequirementsTestExec::new(memory_exec(&schema))
++        .with_maintains_input_order(true)
++        .with_supports_sort_pushdown(false)
++        .into_arc();
++    let plan = sort_exec([sort_expr("a", &schema)].into(), input);
++    let test = EnforceSortingTest::new(plan).with_repartition_sorts(true);
++    assert_snapshot!(test.run(), @r"
++    Input / Optimized Plan:
++    SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
++      RequiredInputOrderingExec
++        DataSourceExec: partitions=1, partition_sizes=[0]
++    ");
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn test_push_with_required_input_ordering_prohibited() -> Result<()> {
+     let schema = create_test_schema3()?;
+diff --git a/datafusion/core/tests/physical_optimizer/test_utils.rs b/datafusion/core/tests/physical_optimizer/test_utils.rs
+index 09225cb03..c8cd7d97e 100644
+--- a/datafusion/core/tests/physical_optimizer/test_utils.rs
++++ b/datafusion/core/tests/physical_optimizer/test_utils.rs
+@@ -397,6 +397,7 @@ pub fn projection_exec(
+ pub struct RequirementsTestExec {
+     required_input_ordering: Option<LexOrdering>,
+     maintains_input_order: bool,
++    supports_sort_pushdown: bool,
+     input: Arc<dyn ExecutionPlan>,
+ }
+ 
+@@ -405,6 +406,7 @@ impl RequirementsTestExec {
+         Self {
+             required_input_ordering: None,
+             maintains_input_order: true,
++            supports_sort_pushdown: true,
+             input,
+         }
+     }
+@@ -424,6 +426,12 @@ impl RequirementsTestExec {
+         self
+     }
+ 
++    /// Set whether sort requirements may move below this node.
++    pub fn with_supports_sort_pushdown(mut self, supported: bool) -> Self {
++        self.supports_sort_pushdown = supported;
++        self
++    }
++
+     /// returns this ExecutionPlan as an `Arc<dyn ExecutionPlan>`
+     pub fn into_arc(self) -> Arc<dyn ExecutionPlan> {
+         Arc::new(self)
+@@ -465,6 +473,10 @@ impl ExecutionPlan for RequirementsTestExec {
+         vec![self.maintains_input_order]
+     }
+ 
++    fn supports_sort_pushdown(&self) -> bool {
++        self.supports_sort_pushdown
++    }
++
+     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+         vec![&self.input]
+     }
+@@ -477,6 +489,7 @@ impl ExecutionPlan for RequirementsTestExec {
+         Ok(RequirementsTestExec::new(Arc::clone(&children[0]))
+             .with_required_input_ordering(self.required_input_ordering.clone())
+             .with_maintains_input_order(self.maintains_input_order)
++            .with_supports_sort_pushdown(self.supports_sort_pushdown)
+             .into_arc())
+     }
+ 
+diff --git a/datafusion/physical-optimizer/src/enforce_sorting/sort_pushdown.rs b/datafusion/physical-optimizer/src/enforce_sorting/sort_pushdown.rs
+index 400161a94..99d6ead3c 100644
+--- a/datafusion/physical-optimizer/src/enforce_sorting/sort_pushdown.rs
++++ b/datafusion/physical-optimizer/src/enforce_sorting/sort_pushdown.rs
+@@ -221,6 +221,9 @@ fn pushdown_requirement_to_children(
+     parent_required: OrderingRequirements,
+     parent_fetch: Option<usize>,
+ ) -> Result<Option<Vec<Option<OrderingRequirements>>>> {
++    if !plan.supports_sort_pushdown() {
++        return Ok(None);
++    }
+     // If there is a limit on the parent plan we cannot push it down through operators that change the cardinality.
+     // E.g. consider if LIMIT 2 is applied below a FilteExec that filters out 1/2 of the rows we'll end up with 1 row instead of 2.
+     // If the LIMIT is applied after the FilterExec and the FilterExec returns > 2 rows we'll end up with 2 rows (correct).
+diff --git a/datafusion/physical-plan/src/execution_plan.rs b/datafusion/physical-plan/src/execution_plan.rs
+index 50eac566d..5dfc06ead 100644
+--- a/datafusion/physical-plan/src/execution_plan.rs
++++ b/datafusion/physical-plan/src/execution_plan.rs
+@@ -200,6 +200,20 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
+         vec![false; self.children().len()]
+     }
+ 
++    /// Whether the sort optimizer may push a requested ordering to this
++    /// node's children, subject to the other ordering requirements.
++    ///
++    /// This is separate from [`Self::maintains_input_order`]: a node can emit
++    /// surviving rows in input order while using their physical positions to
++    /// compute values or filter rows. Such a node must return `false`, because
++    /// sorting its input can change its result.
++    ///
++    /// The default is `true` for compatibility; returning `true` does not
++    /// override the optimizer's other checks or guarantee sort pushdown.
++    fn supports_sort_pushdown(&self) -> bool {
++        true
++    }
++
+     /// Specifies whether the `ExecutionPlan` benefits from increased
+     /// parallelization at its input for each child.
+     ///
