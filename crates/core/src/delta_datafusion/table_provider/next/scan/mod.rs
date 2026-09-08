@@ -1935,6 +1935,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_null_secondary_sort_column_retains_leading_footer_stats() -> TestResult {
+        use parquet::file::{metadata::SortingColumn, properties::WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![20, 10])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+            ],
+        )?;
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(Some(vec![
+                SortingColumn {
+                    column_idx: 0,
+                    descending: true,
+                    nulls_first: false,
+                },
+                SortingColumn {
+                    column_idx: 1,
+                    descending: false,
+                    nulls_first: false,
+                },
+            ]))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("null-secondary.parquet");
+        store.put(&path, buffer.into()).await?;
+        let mut files = vec![(store.head(&path).await?.into(), None)];
+        let session = create_session().into_inner();
+        let (ordering, stats, _) = derive_common_ordering(
+            store,
+            session
+                .runtime_env()
+                .cache_manager
+                .get_file_metadata_cache(),
+            &files,
+            schema.clone(),
+        )
+        .await
+        .expect("sorted footer");
+        apply_footer_sort_stats(&mut files, stats, &schema);
+        assert_eq!(
+            stats_backed_prefix_len(&files, &ordering),
+            1,
+            "missing secondary bounds must not erase valid leading bounds"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_access_plan_for_ordinals() {
         use parquet::arrow::arrow_reader::RowSelector;
