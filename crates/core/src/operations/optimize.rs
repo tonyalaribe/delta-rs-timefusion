@@ -811,7 +811,12 @@ impl MergePlan {
         // (attempt loop / ratchet / cron) takes over.
         const READ_BATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
         loop {
-            let maybe_batch = match tokio::time::timeout(READ_BATCH_IDLE_TIMEOUT, read_stream.next()).await {
+            let maybe_batch = match tokio::time::timeout(
+                READ_BATCH_IDLE_TIMEOUT,
+                read_stream.next(),
+            )
+            .await
+            {
                 Ok(Some(b)) => b,
                 Ok(None) => break,
                 Err(_) => {
@@ -1372,7 +1377,8 @@ async fn create_merge_plan_with_binned_files(
     let (operations, metrics, planner_stats) = match optimize_type {
         OptimizeType::Compact => {
             info!("building compaction plan");
-            build_compaction_plan(log_store, snapshot, filters, target_size, max_files_per_bin).await?
+            build_compaction_plan(log_store, snapshot, filters, target_size, max_files_per_bin)
+                .await?
         }
         OptimizeType::ZOrder(zorder_columns) => {
             info!("building z-order plan");

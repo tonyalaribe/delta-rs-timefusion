@@ -378,7 +378,11 @@ mod tests {
         for (path, idx) in pairs {
             by_file.entry(path).or_default().push(idx);
         }
-        assert_eq!(by_file.len(), 2, "rows must attribute to two distinct files");
+        assert_eq!(
+            by_file.len(),
+            2,
+            "rows must attribute to two distinct files"
+        );
         let mut lens: Vec<usize> = by_file.values().map(Vec::len).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 5], "3-row file and 5-row file");
