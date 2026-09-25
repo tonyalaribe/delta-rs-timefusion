@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 use std::{
     collections::BTreeSet,
@@ -23,7 +23,7 @@ use deltalake_core::logstore::{
     CommitOrBytes, LogStore, LogStoreConfig, LogStoreRef, ObjectStoreRef, get_actions,
 };
 use deltalake_core::operations::optimize::{
-    MetricDetails, Metrics, OptimizeType, PlannerStrategy, create_merge_plan,
+    MetricDetails, Metrics, OptimizeType, PlannerStrategy, SortColumn, create_merge_plan,
 };
 use deltalake_core::protocol::DeltaOperation;
 use deltalake_core::test_utils::TestTables;
@@ -41,6 +41,321 @@ use rand::prelude::*;
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+async fn sorted_xy_values(table: &DeltaTable) -> Result<Vec<(i32, i32)>, Box<dyn Error>> {
+    let ctx: SessionContext = DeltaSessionContext::default().into();
+    table.update_datafusion_session(&ctx.state())?;
+    ctx.register_table("delta_table", table.table_provider().await?)?;
+
+    let batches = ctx
+        .sql("SELECT x, y FROM delta_table ORDER BY x, y")
+        .await?
+        .collect()
+        .await?;
+    let mut values = Vec::new();
+    for batch in batches {
+        let x = batch
+            .column_by_name("x")
+            .ok_or_else(|| std::io::Error::other("missing x column"))?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| std::io::Error::other("x column is not Int32"))?;
+        let y = batch
+            .column_by_name("y")
+            .ok_or_else(|| std::io::Error::other("missing y column"))?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| std::io::Error::other("y column is not Int32"))?;
+        values.extend((0..batch.num_rows()).map(|i| (x.value(i), y.value(i))));
+    }
+    Ok(values)
+}
+
+#[tokio::test]
+async fn test_optimize_sortby_rerun_is_near_noop() -> Result<(), Box<dyn Error>> {
+    // Regression: SortBy used to dump every file in a partition into one bin and
+    // rewrite the whole (growing) partition on every run, so a periodic sorted
+    // compactor could never converge on a busy table. It must now bin-pack and
+    // prune single-file bins like Compact — a re-run over an already-sorted
+    // partition rewrites nothing.
+    let context = setup_test(false).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+
+    for i in 0..4 {
+        write(
+            &mut writer,
+            &mut dt,
+            tuples_to_batch(vec![(i, i + 1), (i, i + 2), (i, i + 3)], "2022-05-22")?,
+        )
+        .await?;
+    }
+    assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 4);
+
+    let sort = vec![SortColumn {
+        column: "x".into(),
+        descending: false,
+        nulls_first: false,
+    }];
+    let target = NonZeroU64::new(2_000_000).unwrap();
+
+    // First run: the four small files bin-pack into one sorted file.
+    let (dt, m1) = dt
+        .optimize()
+        .with_type(OptimizeType::SortBy(sort.clone()))
+        .with_target_size(target)
+        .await?;
+    assert_eq!(m1.num_files_removed, 4);
+    assert_eq!(m1.num_files_added, 1);
+    assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 1);
+
+    // Second run: the lone file is a single-file bin → pruned, nothing rewritten.
+    let (dt, m2) = dt
+        .optimize()
+        .with_type(OptimizeType::SortBy(sort))
+        .with_target_size(target)
+        .await?;
+    assert_eq!(
+        m2.num_files_removed, 0,
+        "re-run must not rewrite already-sorted files"
+    );
+    assert_eq!(m2.num_files_added, 0);
+    assert_eq!(dt.snapshot().unwrap().log_data().num_files(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimize_sortby_dedup_keeps_greatest_tiebreak_across_files()
+-> Result<(), Box<dyn Error>> {
+    let context = setup_test(false).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 10), (2, 20)], "2022-05-22")?,
+    )
+    .await?;
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 30), (3, 40)], "2022-05-22")?,
+    )
+    .await?;
+
+    let sort = vec![SortColumn {
+        column: "x".into(),
+        descending: false,
+        nulls_first: false,
+    }];
+    let dedup = deltalake_core::operations::optimize::DedupConfig {
+        columns: vec!["x".into()],
+        tiebreak: Some(SortColumn {
+            column: "y".into(),
+            descending: true,
+            nulls_first: false,
+        }),
+    };
+    let (dt, metrics) = dt
+        .optimize()
+        .with_type(OptimizeType::SortByDedup(sort, dedup))
+        .with_target_size(NonZeroU64::new(2_000_000).unwrap())
+        .await?;
+
+    assert_eq!(metrics.num_files_removed, 2);
+    assert_eq!(
+        sorted_xy_values(&dt).await?,
+        vec![(1, 30), (2, 20), (3, 40)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimize_sortby_dedup_rewrites_exact_selected_files() -> Result<(), Box<dyn Error>> {
+    let context = setup_test(false).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+    let mut known = std::collections::HashSet::new();
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 10)], "2022-05-22")?,
+    )
+    .await?;
+    let first: Vec<String> = dt
+        .get_file_uris()?
+        .filter(|file| !known.contains(file))
+        .collect();
+    known.extend(first.iter().cloned());
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(1, 30)], "2022-05-22")?,
+    )
+    .await?;
+    let second: Vec<String> = dt
+        .get_file_uris()?
+        .filter(|file| !known.contains(file))
+        .collect();
+    known.extend(second.iter().cloned());
+    write(
+        &mut writer,
+        &mut dt,
+        tuples_to_batch(vec![(2, 20)], "2022-05-22")?,
+    )
+    .await?;
+    assert_eq!(known.len(), 2);
+    let files: Vec<String> = first.into_iter().chain(second).collect();
+
+    let sort = vec![SortColumn {
+        column: "x".into(),
+        descending: false,
+        nulls_first: false,
+    }];
+    let dedup = deltalake_core::operations::optimize::DedupConfig {
+        columns: vec!["x".into()],
+        tiebreak: Some(SortColumn {
+            column: "y".into(),
+            descending: true,
+            nulls_first: false,
+        }),
+    };
+    let (dt, metrics) = dt
+        .optimize()
+        .with_type(OptimizeType::SortByDedup(sort, dedup))
+        .with_files(&files[..2])
+        .with_target_size(NonZeroU64::new(1).unwrap())
+        .await?;
+
+    assert_eq!(metrics.num_files_removed, 2);
+    assert_eq!(sorted_xy_values(&dt).await?, vec![(1, 30), (2, 20)]);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::relative(None, 1)]
+#[case::table_uri(Some(""), 1)]
+#[case::foreign_uri(Some("unrelated/"), 0)]
+#[tokio::test]
+async fn test_optimize_sortby_selected_file_requires_exact_path(
+    #[case] uri_prefix: Option<&str>,
+    #[case] expected_removed: u64,
+) -> Result<(), Box<dyn Error>> {
+    let context = setup_test(false).await?;
+    let mut table = context.table;
+    let mut writer = RecordBatchWriter::for_table(&table)?;
+    write(
+        &mut writer,
+        &mut table,
+        tuples_to_batch(vec![(2, 20), (1, 10)], "2022-05-22")?,
+    )
+    .await?;
+    let paths = table.get_files_by_partitions(&[]).await?;
+    assert_eq!(paths.len(), 1);
+    let selected = vec![uri_prefix.map_or_else(
+        || paths[0].to_string(),
+        |prefix| format!("{prefix}{}", table.log_store().to_uri(&paths[0])),
+    )];
+    let (table, metrics) = table
+        .optimize()
+        .with_type(OptimizeType::SortBy(vec![SortColumn {
+            column: "x".into(),
+            descending: false,
+            nulls_first: false,
+        }]))
+        .with_files(&selected)
+        .await?;
+    assert_eq!(metrics.num_files_removed, expected_removed);
+    assert_eq!(metrics.num_files_added, expected_removed);
+    assert_eq!(sorted_xy_values(&table).await?, vec![(1, 10), (2, 20)]);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_optimize_sortby_physical_order_matches_footer(
+    #[values(false, true)] descending: bool,
+    #[values(false, true)] partitioned: bool,
+) -> Result<(), Box<dyn Error>> {
+    let context = setup_test(partitioned).await?;
+    let mut table = context.table;
+    let mut writer = RecordBatchWriter::for_table(&table)?;
+    for values in [vec![(3, 30), (1, 10)], vec![(4, 40), (2, 20)]] {
+        write(
+            &mut writer,
+            &mut table,
+            tuples_to_batch(values, "2022-05-22")?,
+        )
+        .await?;
+    }
+    let sorting_columns = vec![parquet::file::metadata::SortingColumn {
+        column_idx: 0,
+        descending,
+        nulls_first: false,
+    }];
+    let (table, metrics) = table
+        .optimize()
+        .with_type(OptimizeType::SortBy(vec![SortColumn {
+            column: "x".into(),
+            descending,
+            nulls_first: false,
+        }]))
+        .with_writer_properties(
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2))
+                .set_sorting_columns(Some(sorting_columns.clone()))
+                .build(),
+        )
+        .with_commit_properties(CommitProperties::default().with_incremental_advance(true))
+        .await?;
+    assert_eq!(metrics.num_files_removed, 2);
+    let files = table.get_files_by_partitions(&[]).await?;
+    assert_eq!(files.len(), 1);
+    let metadata = read_parquet_metadata(&files[0], table.object_store()).await?;
+    assert_eq!(metadata.num_row_groups(), 2);
+    for group in metadata.row_groups() {
+        assert_eq!(group.sorting_columns(), Some(&sorting_columns));
+    }
+    let batch = read_parquet_file(&files[0], table.object_store()).await?;
+    let actual = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let expected = if descending {
+        vec![4, 3, 2, 1]
+    } else {
+        vec![1, 2, 3, 4]
+    };
+    assert_eq!(actual.values().as_ref(), expected.as_slice());
+    assert_eq!(
+        sorted_xy_values(&table).await?,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+    );
+    let table = table
+        .write(vec![tuples_to_batch(vec![(5, 50)], "2022-05-22")?])
+        .with_commit_properties(CommitProperties::default().with_incremental_advance(true))
+        .await?;
+    let reloaded = open_table(table.log_store().root_url().clone()).await?;
+    for snapshot in [table.snapshot()?, reloaded.snapshot()?] {
+        let active = snapshot.log_data().into_iter().collect::<Vec<_>>();
+        assert_eq!(active.len(), 2);
+        let sorted = active
+            .iter()
+            .find(|file| file.path().as_ref() == files[0].as_ref())
+            .unwrap();
+        assert_eq!(
+            sorted.tags().get("delta-rs.optimize.sort_by"),
+            Some(&Some("true".to_string()))
+        );
+    }
+    assert_eq!(
+        sorted_xy_values(&table).await?,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+    );
+    Ok(())
+}
 
 struct Context {
     pub tmp_dir: TempDir,
@@ -439,12 +754,9 @@ async fn assert_optimize_preserves_live_rows_with_deletion_vectors(
                 .with_target_size(NonZeroU64::new(1_000_000).unwrap())
                 .await?
         }
-        OptimizeType::ZOrder(columns) => {
-            table
-                .optimize()
-                .with_type(OptimizeType::ZOrder(columns))
-                .await?
-        }
+        kind @ (OptimizeType::ZOrder(_)
+        | OptimizeType::SortBy(_)
+        | OptimizeType::SortByDedup(_, _)) => table.optimize().with_type(kind).await?,
     };
 
     assert_eq!(metrics.num_files_added, 1);
@@ -587,6 +899,56 @@ fn overlap_is_suffix_like(ranges: &[(i32, i32, i64)], lower_bound: i32) -> bool 
         .skip_while(|overlaps| !*overlaps)
         .all(|overlaps| overlaps)
 }
+#[tokio::test]
+async fn test_capped_compaction_converges_without_losing_rows() -> Result<(), Box<dyn Error>> {
+    let context = setup_test(false).await?;
+    let mut table = context.table;
+    let mut writer = RecordBatchWriter::for_table(&table)?;
+    for value in 0..7 {
+        write(
+            &mut writer,
+            &mut table,
+            ordered_range_batch(value, 1, "2022-05-22")?,
+        )
+        .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 7);
+
+    for (expected_files, expected_added) in [(4, 3), (2, 2), (1, 1), (1, 0)] {
+        let (next, metrics) = table
+            .optimize()
+            .with_target_size(NonZeroU64::new(1_000_000).unwrap())
+            .with_max_files_per_bin(NonZeroUsize::new(2).unwrap())
+            .await?;
+        table = next;
+        assert_eq!(table.snapshot()?.log_data().num_files(), expected_files);
+        assert_eq!(metrics.num_files_added, expected_added);
+        assert!(metrics.max_bin_span_files <= 2);
+
+        let session: SessionContext = DeltaSessionContext::default().into();
+        table.update_datafusion_session(&session.state())?;
+        session.register_table("t", table.table_provider().await?)?;
+        let batches = session
+            .sql("SELECT x FROM t ORDER BY x")
+            .await?
+            .collect()
+            .await?;
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, (0..7).map(Some).collect::<Vec<_>>());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_optimize_non_partitioned_table() -> Result<(), Box<dyn Error>> {
     let context = setup_test(false).await?;
@@ -871,7 +1233,9 @@ async fn test_optimize_selected_file_scans_register_operation_scoped_log_store()
         OptimizeType::Compact,
         tracked_table.snapshot()?.snapshot(),
         &[],
+        None,
         Some(NonZeroU64::new(1_000_000).unwrap()),
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -908,6 +1272,58 @@ async fn test_optimize_selected_file_scans_register_operation_scoped_log_store()
         "expected optimize execution to use an operation-scoped object store, got {calls:?}",
     );
 
+    Ok(())
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_incremental_snapshot_preserves_deletion_vectors_through_append_and_compaction(
+    #[values(false, true)] incremental: bool,
+) -> Result<(), Box<dyn Error>> {
+    let DvSmallAppendedTable {
+        _tmp_dir,
+        table,
+        mut expected_values,
+    } = setup_dv_small_with_appended_values().await?;
+    let dv_records = |table: &DeltaTable| {
+        table.snapshot().map(|snapshot| {
+            snapshot
+                .log_data()
+                .into_iter()
+                .filter_map(|file| {
+                    file.deletion_vector_descriptor()
+                        .map(|dv| (file.path().to_string(), dv))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+    };
+    let original_dvs = dv_records(&table)?;
+    assert!(!original_dvs.is_empty());
+    assert!(original_dvs.values().all(|dv| dv.cardinality > 0));
+    let retained = table.clone();
+    let table = table
+        .write(vec![single_int_batch(vec![12, 13])?])
+        .with_commit_properties(CommitProperties::default().with_incremental_advance(incremental))
+        .await?;
+    assert_eq!(sorted_int_values(&retained).await?, expected_values);
+    expected_values.extend([12, 13]);
+    assert_eq!(dv_records(&table)?, original_dvs);
+    let reloaded = open_table(table.log_store().root_url().clone()).await?;
+    assert_eq!(dv_records(&table)?, dv_records(&reloaded)?);
+    assert_eq!(sorted_int_values(&table).await?, expected_values);
+    assert_eq!(sorted_int_values(&reloaded).await?, expected_values);
+
+    let (table, metrics) = table
+        .optimize()
+        .with_target_size(NonZeroU64::new(1_000_000).unwrap())
+        .with_commit_properties(CommitProperties::default().with_incremental_advance(incremental))
+        .await?;
+    assert_eq!(metrics.num_files_removed, 3);
+    assert_eq!(metrics.num_files_added, 1);
+    assert!(dv_records(&table)?.is_empty());
+    assert_eq!(sorted_int_values(&table).await?, expected_values);
+    let reloaded = open_table(table.log_store().root_url().clone()).await?;
+    assert_eq!(sorted_int_values(&reloaded).await?, expected_values);
     Ok(())
 }
 
@@ -1024,6 +1440,8 @@ async fn test_conflict_for_remove_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &filter,
         None,
+        None,
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -1091,6 +1509,8 @@ async fn test_no_conflict_for_append_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?.snapshot(),
         &filter,
         None,
+        None,
+        None,
         WriterProperties::builder().build(),
         df_context.state(),
     )
@@ -1154,6 +1574,8 @@ async fn test_commit_interval() -> Result<(), Box<dyn Error>> {
         OptimizeType::Compact,
         dt.snapshot()?.snapshot(),
         &[],
+        None,
+        None,
         None,
         WriterProperties::builder().build(),
         context.state(),

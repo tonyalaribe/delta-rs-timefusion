@@ -224,6 +224,11 @@ impl LogicalFileView {
             .flatten()
     }
 
+    /// Returns the persisted Add-action tags for this file.
+    pub fn tags(&self) -> HashMap<String, Option<String>> {
+        self.file_constant_map(FIELD_NAME_TAGS).unwrap_or_default()
+    }
+
     fn file_constant_i64(&self, field_name: &str) -> Option<i64> {
         let values = self
             .file_constant_values()?
@@ -548,7 +553,7 @@ impl DeletionVectorView<'_> {
 ///
 /// Handles different string array types (Utf8, LargeUtf8, Utf8View) and
 /// returns None for null values or unsupported types.
-fn get_string_value(data: &dyn Array, index: usize) -> Option<&str> {
+pub(super) fn get_string_value(data: &dyn Array, index: usize) -> Option<&str> {
     match data.data_type() {
         ArrowDataType::Utf8 => {
             let arr = data.as_string::<i32>();

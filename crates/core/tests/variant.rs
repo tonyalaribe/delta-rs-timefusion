@@ -6,7 +6,7 @@ use arrow::array::*;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::common::Result;
-use datafusion::execution::context::SessionContext;
+use deltalake_core::delta_datafusion::DeltaSessionContext;
 use deltalake_core::kernel::{DataType, StructField, StructType};
 use deltalake_core::protocol::SaveMode;
 use deltalake_core::{DeltaTable, DeltaTableBuilder, ensure_table_uri};
@@ -120,8 +120,22 @@ async fn test_datafusion_shredded_variant_fixture() -> Result<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::view_types(true)]
+#[case::canonical_types(false)]
 #[tokio::test]
-async fn test_write_variant_data_end_to_end() -> Result<()> {
+async fn test_write_variant_data_end_to_end(
+    #[case] force_view_types: bool,
+    #[values(false, true)] partitioned: bool,
+) -> Result<()> {
+    let ctx = DeltaSessionContext::new_with_session_overrides(
+        &[(
+            "datafusion.execution.parquet.schema_force_view_types".to_string(),
+            force_view_types.to_string(),
+        )]
+        .into(),
+    )?
+    .into_inner();
     let tmp_dir = tempfile::tempdir().unwrap();
     let table_uri = tmp_dir.path().to_str().unwrap();
     let columns = StructType::try_new([
@@ -134,6 +148,7 @@ async fn test_write_variant_data_end_to_end() -> Result<()> {
         .await?
         .create()
         .with_columns(columns.fields().cloned())
+        .with_partition_columns(if partitioned { vec!["id"] } else { vec![] })
         .await?;
 
     let mut payload = VariantArrayBuilder::new(2);
@@ -156,6 +171,7 @@ async fn test_write_variant_data_end_to_end() -> Result<()> {
     let table = table
         .write(vec![batch])
         .with_save_mode(SaveMode::Append)
+        .with_session_state(Arc::new(ctx.state()))
         .await?;
 
     let protocol = table.snapshot().unwrap().protocol();
@@ -165,8 +181,13 @@ async fn test_write_variant_data_end_to_end() -> Result<()> {
             .is_some_and(|features| features.iter().any(|f| f.as_ref() == "variantType"))
     );
 
-    let ctx = SessionContext::new();
-    ctx.register_table("demo", table.table_provider().await.unwrap())?;
+    ctx.register_table(
+        "demo",
+        table
+            .table_provider()
+            .with_session(Arc::new(ctx.state()))
+            .await?,
+    )?;
 
     let total = ctx
         .sql("SELECT COUNT(*) AS cnt FROM demo")
@@ -191,6 +212,48 @@ async fn test_write_variant_data_end_to_end() -> Result<()> {
     assert_key_variant(&payloads, 0, 1);
     assert_eq!(ids.value(1), 2);
     assert_key_variant(&payloads, 1, 2);
+
+    let (updated, metrics) = table
+        .update()
+        .with_predicate("id = 1")
+        .with_update("id", "id + 10")
+        .with_session_state(Arc::new(ctx.state()))
+        .await?;
+    assert_eq!(metrics.num_updated_rows, 1);
+    let (deleted, metrics) = updated
+        .clone()
+        .delete()
+        .with_predicate("id = 2")
+        .with_session_state(Arc::new(ctx.state()))
+        .await?;
+    assert_eq!(metrics.num_deleted_rows, Some(1));
+
+    for (table, expected) in [(updated, vec![(2, 2), (11, 1)]), (deleted, vec![(11, 1)])] {
+        ctx.deregister_table("demo")?;
+        ctx.register_table(
+            "demo",
+            table
+                .table_provider()
+                .with_session(Arc::new(ctx.state()))
+                .await?,
+        )?;
+        let batches = ctx
+            .sql("SELECT id, payload FROM demo ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let schema = batches[0].schema();
+        let rows = arrow::compute::concat_batches(&schema, &batches)?;
+        assert_eq!(rows.num_rows(), expected.len());
+        let ids = rows
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let payloads = VariantArray::try_new(rows.column(1)).unwrap();
+        for (row, (id, key)) in expected.into_iter().enumerate() {
+            assert_eq!(ids.value(row), id);
+            assert_key_variant(&payloads, row, key);
+        }
+    }
 
     Ok(())
 }

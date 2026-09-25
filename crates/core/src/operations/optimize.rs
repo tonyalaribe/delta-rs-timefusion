@@ -20,15 +20,16 @@
 //! let (table, metrics) = OptimizeBuilder::new(table.object_store(), table.state).await?;
 //! ````
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::execution::context::{SessionContext, SessionState};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -263,13 +264,45 @@ impl Default for MetricDetails {
     }
 }
 
+/// A column to sort by in [`OptimizeType::SortBy`], with its direction.
+#[derive(Debug, Clone)]
+pub struct SortColumn {
+    /// Column name (top-level; nested struct paths use `.`).
+    pub column: String,
+    /// Sort descending when true, ascending when false.
+    pub descending: bool,
+    /// Order nulls first when true.
+    pub nulls_first: bool,
+}
+
+/// Streaming deduplication configuration for [`OptimizeType::SortByDedup`].
+///
+/// Rows with equal `columns` must be consecutive under the requested sort
+/// columns. `tiebreak`, when set, is appended to that sort and makes the first
+/// row in each group the deterministic survivor.
+#[derive(Debug, Clone)]
+pub struct DedupConfig {
+    /// Columns forming the duplicate identity.
+    pub columns: Vec<String>,
+    /// Optional descending/ascending winner selector appended to the sort.
+    pub tiebreak: Option<SortColumn>,
+}
+
 /// Type of optimization to perform.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OptimizeType {
     /// Compact files into pre-determined bins
     Compact,
     /// Z-order files based on provided columns
     ZOrder(Vec<String>),
+    /// Sort rows lexicographically within each merge bin, not across bins.
+    /// Caller-supplied writer properties must declare the matching Parquet
+    /// leaf-column order if readers are to use footer ordering for pushdown.
+    /// This operation does not infer or validate that footer declaration.
+    SortBy(Vec<SortColumn>),
+    /// Like [`OptimizeType::SortBy`], but drops consecutive rows matching the
+    /// configured dedup key while streaming the sorted output to parquet.
+    SortByDedup(Vec<SortColumn>, DedupConfig),
 }
 
 /// Optimize a Delta table with given options
@@ -283,8 +316,17 @@ pub struct OptimizeBuilder<'a> {
     log_store: LogStoreRef,
     /// Filters to select specific table partitions to be optimized
     filters: &'a [FilterLiteral<'a>],
+    /// Exact parquet paths to rewrite. Takes precedence over bin-packing for
+    /// sorted dedup rewrites.
+    selected_files: Option<&'a [String]>,
+    /// Bin selected files by target size instead of merging them as one rewrite.
+    selected_files_binned: bool,
     /// Desired file size after bin-packing files
     target_size: Option<NonZeroU64>,
+    /// Cap on files per merge bin: bounds a rewrite's merge fan-in /
+    /// blocking-sort input on fragmented partitions (memory otherwise scales
+    /// with fragmentation). `None` keeps byte-only binning.
+    max_files_per_bin: Option<NonZeroUsize>,
     /// Properties passed to underlying parquet writer
     writer_properties: Option<WriterProperties>,
     /// Commit properties and configuration
@@ -316,7 +358,10 @@ impl<'a> OptimizeBuilder<'a> {
             snapshot,
             log_store,
             filters: &[],
+            selected_files: None,
+            selected_files_binned: false,
             target_size: None,
+            max_files_per_bin: None,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
             max_concurrent_tasks: std::thread::available_parallelism()
@@ -343,9 +388,32 @@ impl<'a> OptimizeBuilder<'a> {
         self
     }
 
+    /// Rewrite exactly these live parquet paths instead of planner-selected bins.
+    ///
+    /// This is intended for targeted maintenance such as a sealed dedup range:
+    /// every supplied file is retained, even if it exceeds the target size.
+    pub fn with_files(mut self, files: &'a [String]) -> Self {
+        self.selected_files = Some(files);
+        self
+    }
+
+    /// Rewrite selected files in target-sized bins. Unlike [`Self::with_files`],
+    /// this never turns a long hot tail into one unbounded rewrite.
+    pub fn with_binned_files(mut self, files: &'a [String]) -> Self {
+        self.selected_files = Some(files);
+        self.selected_files_binned = true;
+        self
+    }
+
     /// Set the target file size
     pub fn with_target_size(mut self, target: NonZeroU64) -> Self {
         self.target_size = Some(target);
+        self
+    }
+
+    /// Cap the number of files in compact and binned sorted rewrites. Z-order is unchanged.
+    pub fn with_max_files_per_bin(mut self, max_files: NonZeroUsize) -> Self {
+        self.max_files_per_bin = Some(max_files);
         self
     }
 
@@ -444,12 +512,15 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                     cdc: false,
                 },
             )?;
-            let plan = create_merge_plan(
+            let plan = create_merge_plan_with_binned_files(
                 &this.log_store,
                 this.optimize_type,
                 &snapshot,
                 this.filters,
+                this.selected_files.as_deref(),
+                this.selected_files_binned,
                 this.target_size.to_owned(),
+                this.max_files_per_bin,
                 writer_properties,
                 session,
             )
@@ -542,7 +613,22 @@ enum OptimizeOperations {
         Vec<String>,
         HashMap<String, (IndexMap<String, Scalar>, MergeBin)>,
     ),
-    // TODO: Sort
+    /// Plan to lexicographically sort files by the given columns.
+    ///
+    /// Like [`OptimizeType::Compact`], files are bin-packed in stable order up
+    /// to the target size and already-large files are skipped — so a re-run
+    /// over an already-sorted partition rewrites almost nothing. Each bin is
+    /// sorted independently on write, keeping per-run cost bounded to the
+    /// newly-flushed small files rather than the whole (growing) partition.
+    SortBy(
+        Vec<SortColumn>,
+        HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)>,
+    ),
+    SortByDedup(
+        Vec<SortColumn>,
+        DedupConfig,
+        HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)>,
+    ),
 }
 
 impl Default for OptimizeOperations {
@@ -613,10 +699,23 @@ pub struct MergeTaskParameters {
     stats_columns: Option<Vec<String>>,
     /// Budget for rolled files awaiting upload, shared by every task of this optimize run.
     upload_budget: UploadBudget,
+    /// SortBy writes carry this tag in their Add actions so hot-tail schedulers
+    /// can distinguish sorted runs from newly appended files after a restart.
+    sorted_output: bool,
 }
 
 /// A stream of record batches, with a ParquetError on failure.
 type ParquetReadStream = BoxStream<'static, Result<RecordBatch, ParquetError>>;
+
+const READ_BATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+#[derive(Debug, thiserror::Error)]
+#[error("optimize rewrite received no batch for {timeout:?}")]
+struct RewriteReadTimeout {
+    timeout: Duration,
+    #[source]
+    source: tokio::time::error::Elapsed,
+}
 
 #[derive(Clone)]
 struct SelectedFileScanFactory {
@@ -719,7 +818,17 @@ impl MergePlan {
 
         let mut read_stream = read_stream.await?;
 
-        while let Some(maybe_batch) = read_stream.next().await {
+        // A stalled scan or sort must release this rewrite so the caller can retry.
+        while let Some(maybe_batch) =
+            tokio::time::timeout(READ_BATCH_IDLE_TIMEOUT, read_stream.next())
+                .await
+                .map_err(|source| DeltaTableError::GenericError {
+                    source: Box::new(RewriteReadTimeout {
+                        timeout: READ_BATCH_IDLE_TIMEOUT,
+                        source,
+                    }),
+                })?
+        {
             let mut batch = maybe_batch?;
 
             batch = crate::kernel::schema::cast::cast_record_batch(
@@ -734,7 +843,11 @@ impl MergePlan {
 
         let add_actions = writer.close().await?.into_iter().map(|mut add| {
             add.data_change = false;
-
+            if task_parameters.sorted_output {
+                add.tags
+                    .get_or_insert_default()
+                    .insert("delta-rs.optimize.sort_by".into(), Some("true".into()));
+            }
             let size = add.size;
 
             partial_metrics.num_files_added += 1;
@@ -814,6 +927,119 @@ impl MergePlan {
         Ok(stream)
     }
 
+    /// Datafusion-based lexicographic sort read (for [`OptimizeType::SortBy`]).
+    async fn read_sorted(
+        files: MergeBin,
+        context: Arc<SessionContext>,
+        scan_factory: SelectedFileScanFactory,
+        sort_columns: Arc<Vec<SortColumn>>,
+    ) -> Result<BoxStream<'static, Result<RecordBatch, ParquetError>>, DeltaTableError> {
+        use datafusion::functions::core::expr_ext::FieldAccessor;
+        use datafusion::logical_expr::ident;
+
+        let provider = scan_factory.provider_for(files.iter().cloned())?;
+        let df = context.read_table(Arc::new(provider))?;
+
+        let sort_exprs = sort_columns
+            .iter()
+            .map(|sc| {
+                let expr = sc.column.split_once('.').map_or_else(
+                    || ident(&sc.column),
+                    |(first, rest)| {
+                        rest.split('.')
+                            .fold(ident(first), |expr, field| expr.field(field))
+                    },
+                );
+                // Expr::sort(asc, nulls_first): asc = !descending.
+                expr.sort(!sc.descending, sc.nulls_first)
+            })
+            .collect_vec();
+        let df = df.sort(sort_exprs)?;
+
+        let stream = df
+            .execute_stream()
+            .await?
+            .map_err(|err| {
+                ParquetError::General(format!("SortBy failed while scanning data: {err}"))
+            })
+            .boxed();
+
+        Ok(stream)
+    }
+
+    fn dedup_sorted(stream: ParquetReadStream, columns: Arc<Vec<String>>) -> ParquetReadStream {
+        use arrow::array::BooleanArray;
+        use arrow::compute::filter_record_batch;
+        use arrow::row::{OwnedRow, RowConverter, SortField};
+
+        futures::stream::try_unfold(
+            (stream, None, None),
+            move |(mut stream, mut converter, mut previous): (
+                ParquetReadStream,
+                Option<(Vec<usize>, RowConverter)>,
+                Option<OwnedRow>,
+            )| {
+                let columns = Arc::clone(&columns);
+                async move {
+                    loop {
+                        let Some(batch) = stream.try_next().await? else {
+                            return Ok(None);
+                        };
+                        let (indexes, row_converter) = match converter.take() {
+                            Some(converter) => converter,
+                            None => {
+                                let indexes = columns
+                                    .iter()
+                                    .map(|column| {
+                                        batch.schema().index_of(column).map_err(|e| {
+                                            ParquetError::General(format!(
+                                                "SortByDedup key `{column}` missing: {e}"
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let fields = indexes
+                                    .iter()
+                                    .map(|&i| SortField::new(batch.column(i).data_type().clone()))
+                                    .collect::<Vec<_>>();
+                                (
+                                    indexes,
+                                    RowConverter::new(fields).map_err(|e| {
+                                        ParquetError::General(format!(
+                                            "SortByDedup key conversion: {e}"
+                                        ))
+                                    })?,
+                                )
+                            }
+                        };
+                        let key_columns = indexes
+                            .iter()
+                            .map(|&i| batch.column(i).clone())
+                            .collect::<Vec<_>>();
+                        let rows = row_converter.convert_columns(&key_columns).map_err(|e| {
+                            ParquetError::General(format!("SortByDedup key conversion: {e}"))
+                        })?;
+                        let mut keep = Vec::with_capacity(batch.num_rows());
+                        for i in 0..batch.num_rows() {
+                            let row = rows.row(i).owned();
+                            keep.push(previous.as_ref() != Some(&row));
+                            previous = Some(row);
+                        }
+                        converter = Some((indexes, row_converter));
+                        if keep.iter().any(|&keep| keep) {
+                            let batch = filter_record_batch(&batch, &BooleanArray::from(keep))
+                                .map_err(|e| {
+                                    ParquetError::General(format!("SortByDedup filter: {e}"))
+                                })?;
+                            return Ok(Some((batch, (stream, converter, previous))));
+                        }
+                    }
+                }
+            },
+        )
+        .boxed()
+    }
+
     /// Perform the operations outlined in the plan.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(operation = "optimize", version = snapshot.version()))]
@@ -869,7 +1095,7 @@ impl MergePlan {
                             scan_factory.clone(),
                         );
 
-                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                        let rewrite_result = SpawnedTask::spawn(Self::rewrite_files(
                             task_parameters.clone(),
                             partition,
                             files,
@@ -912,7 +1138,7 @@ impl MergePlan {
                             exec_context.clone(),
                             scan_factory.clone(),
                         );
-                        let rewrite_result = tokio::task::spawn(Self::rewrite_files(
+                        let rewrite_result = SpawnedTask::spawn(Self::rewrite_files(
                             task_parameters.clone(),
                             partition,
                             files,
@@ -923,6 +1149,99 @@ impl MergePlan {
                         util::flatten_join_error(rewrite_result)
                     })
                     .buffer_unordered(max_concurrent_tasks)
+                    .boxed()
+            }
+            OptimizeOperations::SortBy(sort_columns, bins) => {
+                debug!("Starting sort with the columns: {sort_columns:?}");
+
+                let read_context = Arc::new(SessionContext::new_with_state(
+                    read_session.as_ref().clone(),
+                ));
+                let scan_factory = SelectedFileScanFactory::new(
+                    snapshot,
+                    log_store.clone(),
+                    self.scan_config.clone(),
+                    Some(operation_id),
+                );
+                let task_parameters = self.task_parameters.clone();
+                let sort_columns = Arc::new(sort_columns);
+                let log_store = log_store.clone();
+
+                futures::stream::iter(bins)
+                    .flat_map(|(_, (partition, bins))| {
+                        futures::stream::iter(bins).map(move |bin| (partition.clone(), bin))
+                    })
+                    .map(move |(partition, files)| {
+                        let batch_stream = Self::read_sorted(
+                            files.clone(),
+                            read_context.clone(),
+                            scan_factory.clone(),
+                            sort_columns.clone(),
+                        );
+                        let rewrite_result = SpawnedTask::spawn(Self::rewrite_files(
+                            task_parameters.clone(),
+                            partition,
+                            files,
+                            log_store.object_store(Some(operation_id)),
+                            batch_stream,
+                            // Bins are pre-packed to <= target_size, so each
+                            // writes one sorted output file (no re-split).
+                            true,
+                        ));
+                        util::flatten_join_error(rewrite_result)
+                    })
+                    .buffered(max_concurrent_tasks)
+                    .boxed()
+            }
+            OptimizeOperations::SortByDedup(sort_columns, dedup, bins) => {
+                debug!("Starting deduplicating sort with the columns: {sort_columns:?}");
+                let read_context = Arc::new(SessionContext::new_with_state(
+                    read_session.as_ref().clone(),
+                ));
+                let scan_factory = SelectedFileScanFactory::new(
+                    snapshot,
+                    log_store.clone(),
+                    self.scan_config.clone(),
+                    Some(operation_id),
+                );
+                let task_parameters = self.task_parameters.clone();
+                let mut sort_columns = sort_columns;
+                if let Some(tiebreak) = &dedup.tiebreak
+                    && !sort_columns
+                        .iter()
+                        .any(|column| column.column == tiebreak.column)
+                {
+                    sort_columns.push(tiebreak.clone());
+                }
+                let sort_columns = Arc::new(sort_columns);
+                let dedup_columns = Arc::new(dedup.columns);
+                let log_store = log_store.clone();
+
+                futures::stream::iter(bins)
+                    .flat_map(|(_, (partition, bins))| {
+                        futures::stream::iter(bins).map(move |bin| (partition.clone(), bin))
+                    })
+                    .map(move |(partition, files)| {
+                        let read = Self::read_sorted(
+                            files.clone(),
+                            read_context.clone(),
+                            scan_factory.clone(),
+                            sort_columns.clone(),
+                        );
+                        let columns = dedup_columns.clone();
+                        let batch_stream =
+                            async move { Ok(Self::dedup_sorted(read.await?, columns)) };
+                        let rewrite_result = SpawnedTask::spawn(Self::rewrite_files(
+                            task_parameters.clone(),
+                            partition,
+                            files,
+                            log_store.object_store(Some(operation_id)),
+                            batch_stream,
+                            true,
+                        ));
+                        util::flatten_join_error(rewrite_result)
+                    })
+                    .buffered(max_concurrent_tasks)
                     .boxed()
             }
         };
@@ -964,7 +1283,8 @@ impl MergePlan {
                 let actions = std::mem::take(&mut actions);
                 last_commit = now;
 
-                let mut properties = CommitProperties::default();
+                let mut properties = CommitProperties::default()
+                    .with_incremental_advance(commit_properties.incremental_advance);
                 properties.app_metadata = commit_properties.app_metadata.clone();
                 properties
                     .app_metadata
@@ -1021,7 +1341,36 @@ pub async fn create_merge_plan(
     optimize_type: OptimizeType,
     snapshot: &EagerSnapshot,
     filters: &[FilterLiteral<'_>],
+    selected_files: Option<&[String]>,
     target_size: Option<NonZeroU64>,
+    max_files_per_bin: Option<NonZeroUsize>,
+    writer_properties: WriterProperties,
+    session: SessionState,
+) -> Result<MergePlan, DeltaTableError> {
+    create_merge_plan_with_binned_files(
+        log_store,
+        optimize_type,
+        snapshot,
+        filters,
+        selected_files,
+        false,
+        target_size,
+        max_files_per_bin,
+        writer_properties,
+        session,
+    )
+    .await
+}
+
+async fn create_merge_plan_with_binned_files(
+    log_store: &dyn LogStore,
+    optimize_type: OptimizeType,
+    snapshot: &EagerSnapshot,
+    filters: &[FilterLiteral<'_>],
+    selected_files: Option<&[String]>,
+    selected_files_binned: bool,
+    target_size: Option<NonZeroU64>,
+    max_files_per_bin: Option<NonZeroUsize>,
     writer_properties: WriterProperties,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
@@ -1029,10 +1378,15 @@ pub async fn create_merge_plan(
     let _ = optimize_target_size_to_i64(target_size)?;
     let partitions_keys = snapshot.metadata().partition_columns();
 
+    let sorted_output = matches!(
+        &optimize_type,
+        OptimizeType::SortBy(_) | OptimizeType::SortByDedup(_, _)
+    );
     let (operations, metrics, planner_stats) = match optimize_type {
         OptimizeType::Compact => {
             info!("building compaction plan");
-            build_compaction_plan(log_store, snapshot, filters, target_size).await?
+            build_compaction_plan(log_store, snapshot, filters, target_size, max_files_per_bin)
+                .await?
         }
         OptimizeType::ZOrder(zorder_columns) => {
             info!("building z-order plan");
@@ -1042,6 +1396,38 @@ pub async fn create_merge_plan(
                 snapshot,
                 partitions_keys,
                 filters,
+            )
+            .await?
+        }
+        OptimizeType::SortBy(sort_columns) => {
+            info!("building sort plan");
+            build_sort_plan(
+                log_store,
+                sort_columns,
+                None,
+                snapshot,
+                partitions_keys,
+                filters,
+                selected_files,
+                selected_files_binned,
+                target_size,
+                max_files_per_bin,
+            )
+            .await?
+        }
+        OptimizeType::SortByDedup(sort_columns, dedup) => {
+            info!("building deduplicating sort plan");
+            build_sort_plan(
+                log_store,
+                sort_columns,
+                Some(dedup),
+                snapshot,
+                partitions_keys,
+                filters,
+                selected_files,
+                selected_files_binned,
+                target_size,
+                max_files_per_bin,
             )
             .await?
         }
@@ -1083,6 +1469,7 @@ pub async fn create_merge_plan(
                 .as_ref()
                 .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
             upload_budget,
+            sorted_output,
         }),
         read_table_version: snapshot.version(),
         read_session: Arc::new(session),
@@ -1152,7 +1539,13 @@ struct OrderedFileCandidate {
 fn plan_compaction_bins_in_stable_order(
     files: Vec<OrderedFileCandidate>,
     target_size: u64,
+    max_files_per_bin: Option<NonZeroUsize>,
 ) -> (Vec<MergeBin>, PlannerStats) {
+    // Byte-bounded bins have unbounded file counts: a fragmented partition
+    // (hundreds of tiny files) packs into one bin, and the rewrite's merge
+    // fan-in / blocking-sort input scales with that count — memory demand
+    // peaks exactly when compaction is most needed. The count cap bounds it;
+    // repeated passes still converge to target_size.
     let mut bins = Vec::new();
     let mut current = MergeBin::new();
     let mut current_first_ordinal = None;
@@ -1183,7 +1576,9 @@ fn plan_compaction_bins_in_stable_order(
             continue;
         }
 
-        if current.total_file_size() + file.size_bytes <= target_size {
+        if max_files_per_bin.is_none_or(|limit| current.len() < limit.get())
+            && current.total_file_size() + file.size_bytes <= target_size
+        {
             current.add(file.add);
             current_last_ordinal = Some(file.stable_ordinal);
             continue;
@@ -1211,11 +1606,19 @@ fn plan_compaction_bins_in_stable_order(
     (bins, planner_stats)
 }
 
+/// Full partition values for a rewritten file, in table partition-column
+/// order. `LogFileView::partition_values()` exposes `partitionValues_parsed`,
+/// which the kernel narrows to the predicate-referenced subset when a filter
+/// is pushed into `file_views` — grouping on it dropped the un-referenced
+/// partition columns from OPTIMIZE output (e.g. `project_id` when compacting
+/// with a `date = ...` filter), silently NULLing them on read. Rebuild from
+/// the raw string map in the Add action instead.
 async fn build_compaction_plan(
     log_store: &dyn LogStore,
     snapshot: &EagerSnapshot,
     filters: &[FilterLiteral<'_>],
     target_size: NonZeroU64,
+    max_files_per_bin: Option<NonZeroUsize>,
 ) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
     type PartitionFileEntry = (IndexMap<String, Scalar>, usize, Vec<OrderedFileCandidate>);
 
@@ -1243,6 +1646,7 @@ async fn build_compaction_plan(
         let object_meta = ObjectMeta::try_from(&file)?;
         let partition_values =
             file.full_partition_values(partition_columns, table_schema.as_ref())?;
+        let add = file.to_add();
         let partition_path = partition_values.hive_partition_path();
         let entry = partition_files
             .entry(partition_path)
@@ -1256,7 +1660,7 @@ async fn build_compaction_plan(
         }
 
         entry.2.push(OrderedFileCandidate {
-            add: file.to_add(),
+            add,
             stable_ordinal,
             size_bytes: object_meta.size,
         });
@@ -1265,7 +1669,7 @@ async fn build_compaction_plan(
     let mut operations: HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)> = HashMap::new();
     for (part, (partition, _, files)) in partition_files {
         let (merge_bins, partition_stats) =
-            plan_compaction_bins_in_stable_order(files, target_size.get());
+            plan_compaction_bins_in_stable_order(files, target_size.get(), max_files_per_bin);
         planner_stats.absorb(&partition_stats);
 
         operations.insert(part, (partition, merge_bins));
@@ -1395,10 +1799,201 @@ async fn build_zorder_plan(
     ))
 }
 
+/// Build bounded sorted-rewrite bins or one explicitly selected rewrite per partition.
+async fn build_sort_plan(
+    log_store: &dyn LogStore,
+    sort_columns: Vec<SortColumn>,
+    dedup: Option<DedupConfig>,
+    snapshot: &EagerSnapshot,
+    partition_keys: &[String],
+    filters: &[FilterLiteral<'_>],
+    selected_files: Option<&[String]>,
+    selected_files_binned: bool,
+    target_size: NonZeroU64,
+    max_files_per_bin: Option<NonZeroUsize>,
+) -> Result<(OptimizeOperations, Metrics, PlannerStats), DeltaTableError> {
+    if sort_columns.is_empty() {
+        return Err(DeltaTableError::Generic(
+            "SortBy requires at least one column".to_string(),
+        ));
+    }
+    let sort_partition_cols = sort_columns
+        .iter()
+        .filter(|c| partition_keys.contains(&c.column))
+        .collect_vec();
+    if !sort_partition_cols.is_empty() {
+        return Err(DeltaTableError::Generic(format!(
+            "SortBy columns cannot be partition columns. Found: {sort_partition_cols:?}"
+        )));
+    }
+    for c in &sort_columns {
+        validate_zorder_column(snapshot.schema().as_ref(), &c.column)?;
+    }
+    if let Some(dedup) = &dedup {
+        if dedup.columns.is_empty() {
+            return Err(DeltaTableError::Generic(
+                "SortByDedup requires at least one dedup column".to_string(),
+            ));
+        }
+        for column in &dedup.columns {
+            validate_zorder_column(snapshot.schema().as_ref(), column)?;
+        }
+        if let Some(tiebreak) = &dedup.tiebreak {
+            validate_zorder_column(snapshot.schema().as_ref(), &tiebreak.column)?;
+        }
+    }
+
+    type PartitionFileEntry = (IndexMap<String, Scalar>, usize, Vec<OrderedFileCandidate>);
+
+    let mut metrics = Metrics::default();
+    let mut planner_stats = PlannerStats::preserve_locality();
+    let mut partition_files: HashMap<String, PartitionFileEntry> = HashMap::new();
+
+    let predicate = if filters.is_empty() {
+        None
+    } else {
+        Some(Arc::new(conjunction_to_kernel_predicate(
+            filters,
+            snapshot.schema().as_ref(),
+        )?))
+    };
+
+    let selected: Option<HashSet<&str>> =
+        selected_files.map(|files| files.iter().map(String::as_str).collect());
+    let mut file_stream = snapshot.file_views(log_store, predicate);
+    while let Some(file) = file_stream.next().await {
+        let file = file?;
+        let add = file.to_add();
+        if selected.as_ref().is_some_and(|files| {
+            !files.contains(add.path.as_str())
+                && !files.contains(log_store.to_uri(&file.object_store_path()).as_str())
+        }) {
+            continue;
+        }
+        metrics.total_considered_files += 1;
+        let object_meta = ObjectMeta::try_from(&file)?;
+        let partition_values =
+            file.full_partition_values(partition_keys, snapshot.schema().as_ref())?;
+        let entry = partition_files
+            .entry(partition_values.hive_partition_path())
+            .or_insert_with(|| (partition_values, 0, vec![]));
+        let stable_ordinal = entry.1;
+        entry.1 += 1;
+
+        if selected.is_none() && object_meta.size > target_size.get() {
+            metrics.total_files_skipped += 1;
+            continue;
+        }
+        entry.2.push(OrderedFileCandidate {
+            add,
+            stable_ordinal,
+            size_bytes: object_meta.size,
+        });
+    }
+
+    let mut operations: HashMap<String, (IndexMap<String, Scalar>, Vec<MergeBin>)> = HashMap::new();
+    for (part, (partition, _, files)) in partition_files {
+        let (merge_bins, partition_stats) = if selected.is_some() && !selected_files_binned {
+            let mut bin = MergeBin::new();
+            for file in files {
+                bin.add(file.add);
+            }
+            (vec![bin], PlannerStats::preserve_locality())
+        } else {
+            plan_compaction_bins_in_stable_order(files, target_size.get(), max_files_per_bin)
+        };
+        planner_stats.absorb(&partition_stats);
+        operations.insert(part, (partition, merge_bins));
+    }
+
+    if selected.is_none() {
+        // A lone normal SortBy file is already sorted; exact-file rewrites must
+        // retain it because the caller explicitly selected it for dedup.
+        for (_, (_, bins)) in operations.iter_mut() {
+            bins.retain(|bin| {
+                if bin.len() == 1 {
+                    metrics.total_files_skipped += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+    operations.retain(|_, (_, bins)| !bins.is_empty());
+    metrics.partitions_optimized = operations.len() as u64;
+
+    let operation = match dedup {
+        Some(dedup) => OptimizeOperations::SortByDedup(sort_columns, dedup, operations),
+        None => OptimizeOperations::SortBy(sort_columns, operations),
+    };
+    Ok((operation, metrics, planner_stats))
+}
+
 #[cfg(test)]
 mod compact_planner_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[rstest::rstest]
+    #[case::before_first_batch(0)]
+    #[case::after_first_batch(1)]
+    #[tokio::test(start_paused = true)]
+    async fn stalled_rewrite_expires_without_publishing(#[case] prefix_batches: usize) {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use object_store::ObjectStore;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let parameters = Arc::new(MergeTaskParameters {
+            file_schema: schema,
+            writer_properties: WriterProperties::builder().build(),
+            input_parameters: OptimizeInput {
+                target_size: NonZeroU64::new(1_000_000).unwrap(),
+                predicate: None,
+            },
+            num_indexed_cols: DataSkippingNumIndexedCols::NumColumns(1),
+            stats_columns: None,
+            upload_budget: UploadBudget::new(1_000_000),
+            sorted_output: false,
+        });
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let stream: ParquetReadStream =
+            futures::stream::iter(std::iter::once(Ok(batch)).take(prefix_batches))
+                .chain(futures::stream::pending())
+                .boxed();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20 * 60 + 1),
+            MergePlan::rewrite_files(
+                parameters,
+                IndexMap::new(),
+                MergeBin::new(),
+                store.clone(),
+                async { Ok(stream) },
+                true,
+            ),
+        )
+        .await
+        .expect("rewrite must enforce its idle limit before the outer deadline");
+        let DeltaTableError::GenericError { source } = result.unwrap_err() else {
+            panic!("expected a timeout with its source error preserved");
+        };
+        assert!(source.source().unwrap().is::<tokio::time::error::Elapsed>());
+        assert!(
+            store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn candidate(stable_ordinal: usize, size_bytes: u64) -> OrderedFileCandidate {
         OrderedFileCandidate {
@@ -1426,6 +2021,34 @@ mod compact_planner_tests {
             .collect::<Vec<_>>()
     }
 
+    #[rstest::rstest]
+    #[case::uncapped(None, 1)]
+    #[case::one(NonZeroUsize::new(1), 100)]
+    #[case::two(NonZeroUsize::new(2), 50)]
+    #[case::partial_last_bin(NonZeroUsize::new(16), 7)]
+    #[case::exact(NonZeroUsize::new(100), 1)]
+    #[case::larger_than_input(NonZeroUsize::new(101), 1)]
+    fn test_bins_capped_by_max_files_per_bin(
+        #[case] limit: Option<NonZeroUsize>,
+        #[case] expected_bins: usize,
+    ) {
+        let files = (0..100).map(|i| candidate(i, 1)).collect();
+        let (bins, stats) = plan_compaction_bins_in_stable_order(files, 1_000_000, limit);
+        assert_eq!(bins.len(), expected_bins);
+        assert!(
+            bins.iter()
+                .all(|bin| limit.is_none_or(|cap| bin.len() <= cap.get()))
+        );
+        assert_eq!(
+            bins.iter().flat_map(ordinals).collect::<Vec<_>>(),
+            (0..100).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stats.max_bin_span_files,
+            bins.iter().map(MergeBin::len).max().unwrap()
+        );
+    }
+
     #[test]
     fn test_ordered_compact_bins_are_contiguous() {
         let (bins, stats) = plan_compaction_bins_in_stable_order(
@@ -1436,6 +2059,7 @@ mod compact_planner_tests {
                 candidate(3, 3),
             ],
             10,
+            None,
         );
 
         let planned_ordinals = bins.iter().map(ordinals).collect::<Vec<_>>();
@@ -1454,6 +2078,7 @@ mod compact_planner_tests {
                 candidate(3, 2),
             ],
             10,
+            None,
         );
 
         let planned_ordinals = bins.iter().map(ordinals).collect::<Vec<_>>();
@@ -1469,7 +2094,7 @@ mod compact_planner_tests {
     #[test]
     fn test_ordered_compact_bins_respect_ordinal_gaps() {
         let (bins, stats) =
-            plan_compaction_bins_in_stable_order(vec![candidate(0, 3), candidate(2, 3)], 10);
+            plan_compaction_bins_in_stable_order(vec![candidate(0, 3), candidate(2, 3)], 10, None);
 
         let planned_ordinals = bins.iter().map(ordinals).collect::<Vec<_>>();
 
@@ -1487,6 +2112,7 @@ mod compact_planner_tests {
                 candidate(3, 9),
             ],
             10,
+            None,
         );
 
         assert_eq!(stats.planner_strategy, PlannerStrategy::PreserveLocality);
@@ -1737,7 +2363,7 @@ pub(super) mod zorder {
                 let schema = Arc::new(ArrowSchema::new(vec![
                     Field::new("moDified", DataType::Utf8, true),
                     Field::new("ID", DataType::Utf8, true),
-                    Field::new("vaLue", DataType::Int32, true),
+                    Field::new("vaLUE", DataType::Int32, true),
                 ]));
 
                 let batch = RecordBatch::try_new(

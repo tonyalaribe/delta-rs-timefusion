@@ -54,7 +54,7 @@ const DELTA_MATERIALIZED_PUSHDOWN_SENTINEL: &str =
 pub(super) enum DvExecutionState {
     NotPresent,
     Sequential {
-        /// Keep masks shared by plan clones. Each execution copies and consumes them.
+        /// Immutable keep masks shared by plans and executions.
         selection_vectors: Arc<HashMap<String, Vec<bool>>>,
         /// Expected object store and path for each file ID in the child plan.
         physical_file_identities: Arc<super::PhysicalFileIdentityMap>,
@@ -66,7 +66,7 @@ impl DvExecutionState {
         matches!(self, Self::Sequential { .. })
     }
 
-    fn selection_vectors(&self) -> Option<&HashMap<String, Vec<bool>>> {
+    fn selection_vectors(&self) -> Option<&Arc<HashMap<String, Vec<bool>>>> {
         match self {
             Self::NotPresent => None,
             Self::Sequential {
@@ -86,50 +86,17 @@ impl DvExecutionState {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) struct DvMaskResult {
-    pub selection: Option<Vec<bool>>,
-    pub should_remove: bool,
-}
-
-/// Consume the per-file deletion-vector keep-mask for the current batch.
-///
-/// The keep-mask is stored once per file and consumed incrementally as parquet
-/// batches are produced:
-/// - If the mask is shorter than the batch, missing trailing entries are
-///   treated as `true` (keep row).
-/// - If the mask is longer than the batch, the remainder is preserved for the
-///   next batch from the same file.
-///
-/// This function intentionally does not error when `selection_vector.len()` is
-/// greater than `batch_num_rows`; that is expected when one file spans multiple
-/// input batches.
-pub(crate) fn consume_dv_mask(
-    selection_vector: &mut Vec<bool>,
-    batch_num_rows: usize,
-) -> DvMaskResult {
-    if selection_vector.is_empty() {
-        return DvMaskResult {
-            selection: None,
-            should_remove: true,
-        };
-    }
-
-    if selection_vector.len() >= batch_num_rows {
-        let sv: Vec<bool> = selection_vector.drain(0..batch_num_rows).collect();
-        let is_empty = selection_vector.is_empty();
-        DvMaskResult {
-            selection: Some(sv),
-            should_remove: is_empty,
-        }
-    } else {
-        let mut sv: Vec<bool> = std::mem::take(selection_vector);
-        sv.resize(batch_num_rows, true);
-        DvMaskResult {
-            selection: Some(sv),
-            should_remove: true,
-        }
-    }
+/// Read one batch's keep-mask using an execution-local cursor.
+/// Missing trailing entries keep the row. The plan's mask never changes.
+fn consume_dv_mask(mask: &[bool], offset: &mut usize, batch_num_rows: usize) -> Option<Vec<bool>> {
+    let remaining = mask
+        .get(*offset..)
+        .filter(|remaining| !remaining.is_empty())?;
+    let count = remaining.len().min(batch_num_rows);
+    let mut selection = remaining[..count].to_vec();
+    *offset += count;
+    selection.resize(batch_num_rows, true);
+    Some(selection)
 }
 
 /// Physical execution plan for scanning Delta tables.
@@ -564,13 +531,8 @@ impl ExecutionPlan for DeltaScanExec {
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
             transforms: Arc::clone(&self.transforms),
-            // Each stream consumes its masks as it reads batches. Deep-copy the masks
-            // once per execution to isolate repeated or concurrent scans.
-            selection_vectors: self
-                .dv_state
-                .selection_vectors()
-                .cloned()
-                .unwrap_or_default(),
+            selection_vectors: self.dv_state.selection_vectors().cloned(),
+            selection_vector_offsets: HashMap::new(),
             public_file_ids: Arc::clone(&self.public_file_ids),
             input_file_id_column: self.input_file_id_column.clone(),
             file_id_column: self.file_id_column.clone(),
@@ -727,7 +689,9 @@ struct DeltaScanStream {
     /// Transforms to be applied to data read from individual files
     transforms: Arc<HashMap<String, ExpressionRef>>,
     /// Selection vectors to be applied to data read from individual files
-    selection_vectors: HashMap<String, Vec<bool>>,
+    selection_vectors: Option<Arc<HashMap<String, Vec<bool>>>>,
+    /// Cursors belong to this execution, not the reusable plan.
+    selection_vector_offsets: HashMap<String, usize>,
     /// Public file paths keyed by compact scan file id.
     public_file_ids: Arc<super::PublicFileIdMap>,
     /// File id column name carried by the input batches for per file correlation.
@@ -773,21 +737,21 @@ impl DeltaScanStream {
         file_id: String,
         file_id_idx: usize,
     ) -> Result<RecordBatch> {
-        let dv_result = if let Some(selection_vector) = self.selection_vectors.get_mut(&file_id) {
-            consume_dv_mask(selection_vector, batch.num_rows())
-        } else {
-            DvMaskResult {
-                selection: None,
-                should_remove: false,
-            }
-        };
-
-        if dv_result.should_remove {
-            self.selection_vectors.remove(&file_id);
-        }
-
-        let mut batch = if let Some(selection) = dv_result.selection {
-            filter_record_batch(&batch, &BooleanArray::from(selection))?
+        let raw_num_rows = batch.num_rows();
+        let selection = self
+            .selection_vectors
+            .as_ref()
+            .and_then(|masks| masks.get(&file_id))
+            .and_then(|mask| {
+                let offset = self
+                    .selection_vector_offsets
+                    .entry(file_id.clone())
+                    .or_default();
+                consume_dv_mask(mask, offset, raw_num_rows)
+            })
+            .map(BooleanArray::from);
+        let mut batch = if let Some(selection) = &selection {
+            filter_record_batch(&batch, selection)?
         } else {
             batch
         };
@@ -829,15 +793,22 @@ impl DeltaScanStream {
             )
         }?;
 
-        self.append_row_index(result, &file_id)
+        self.append_row_index(result, &file_id, raw_num_rows, selection.as_ref())
     }
 
-    fn append_row_index(&mut self, batch: RecordBatch, file_id: &str) -> Result<RecordBatch> {
+    /// Number physical rows before filtering, then retain the surviving positions.
+    fn append_row_index(
+        &mut self,
+        batch: RecordBatch,
+        file_id: &str,
+        raw_num_rows: usize,
+        selection: Option<&BooleanArray>,
+    ) -> Result<RecordBatch> {
         let Some(row_index_field) = self.row_index_field.clone() else {
             return Ok(batch);
         };
 
-        let row_count = u64::try_from(batch.num_rows()).map_err(|_| {
+        let row_count = u64::try_from(raw_num_rows).map_err(|_| {
             internal_datafusion_err!("batch row count does not fit u64 while assigning row indexes")
         })?;
         let next_row_index = self
@@ -850,10 +821,15 @@ impl DeltaScanStream {
             )
         })?;
 
-        let values = if row_count == 0 {
-            Vec::new()
-        } else {
-            ((*next_row_index + 1)..=end).collect()
+        // The exclusive end bounds index + 1, including an empty batch at u64::MAX.
+        let positions = (*next_row_index..end).map(|index| index + 1);
+        let values: Vec<u64> = match selection {
+            // The mask comes from Vec<bool>, so it cannot contain nulls.
+            Some(selection) => positions
+                .zip(selection.values().iter())
+                .filter_map(|(index, keep)| keep.then_some(index))
+                .collect(),
+            None => positions.collect(),
         };
         *next_row_index = end;
 
@@ -1845,8 +1821,6 @@ mod tests {
         let downcast = scan.downcast_ref::<DeltaScanExec>();
         assert!(downcast.is_some(), "Expected DeltaScanExec for DV test");
 
-        let batches = collect(scan, session.task_ctx()).await?;
-
         let expected = vec![
             "+--------+-----+------------+",
             "| letter | int | date       |",
@@ -1854,7 +1828,12 @@ mod tests {
             "| b      | 228 | 1978-12-01 |",
             "+--------+-----+------------+",
         ];
-        assert_batches_sorted_eq!(&expected, &batches);
+        for _execution in 0..2 {
+            let plan =
+                datafusion::physical_plan::execution_plan::reset_plan_states(Arc::clone(&scan))?;
+            let batches = collect(plan, session.task_ctx()).await?;
+            assert_batches_sorted_eq!(&expected, &batches);
+        }
 
         Ok(())
     }
@@ -2061,7 +2040,7 @@ mod tests {
             .build();
         let grouped_input = DataSourceExec::from_data_source(grouped_config);
 
-        let mut selection_vectors = exec.dv_state.selection_vectors().unwrap().clone();
+        let mut selection_vectors = exec.dv_state.selection_vectors().unwrap().as_ref().clone();
         let duplicate_mask = selection_vectors
             .get(&original_file_id)
             .expect("fixture must provide the original mask")
@@ -2273,7 +2252,8 @@ mod tests {
             input,
             baseline_metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
             transforms: Arc::new(HashMap::new()),
-            selection_vectors,
+            selection_vectors: Some(Arc::new(selection_vectors)),
+            selection_vector_offsets: HashMap::new(),
             public_file_ids: Arc::new(public_file_ids),
             input_file_id_column,
             file_id_column,
@@ -2470,8 +2450,17 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::unmasked(vec![], vec![1, 2], vec![3, 4])]
+    #[case::holes(vec![false, true, false, true], vec![2], vec![4])]
+    #[case::empty_first_batch(vec![false, false, true, true], vec![], vec![3, 4])]
+    #[case::short_mask(vec![false, true, false], vec![2], vec![4])]
     #[tokio::test]
-    async fn test_poll_next_continues_row_ordinals_across_batches_for_same_file() -> TestResult {
+    async fn test_poll_next_continues_row_ordinals_across_batches_for_same_file(
+        #[case] mask: Vec<bool>,
+        #[case] first_ordinals: Vec<u64>,
+        #[case] second_ordinals: Vec<u64>,
+    ) -> TestResult {
         use futures::StreamExt;
 
         let (kernel_type, scan_plan) = int32_scan_plan().await?;
@@ -2482,7 +2471,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            HashMap::new(),
+            HashMap::from([("f1".to_string(), mask)]),
             vec![first, second],
             None,
         );
@@ -2490,8 +2479,8 @@ mod tests {
         let batch1 = stream.next().await.transpose()?.expect("first batch");
         let batch2 = stream.next().await.transpose()?.expect("second batch");
         assert!(stream.next().await.is_none());
-        assert_eq!(row_ordinals(&batch1, "row_ordinal"), vec![1, 2]);
-        assert_eq!(row_ordinals(&batch2, "row_ordinal"), vec![3, 4]);
+        assert_eq!(row_ordinals(&batch1, "row_ordinal"), first_ordinals);
+        assert_eq!(row_ordinals(&batch2, "row_ordinal"), second_ordinals);
 
         Ok(())
     }
@@ -2840,121 +2829,39 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_dv_short_mask_drain_and_pad() {
-        use super::{DvMaskResult, consume_dv_mask};
-
-        let mut sv = vec![true, false, true];
-        let result = consume_dv_mask(&mut sv, 5);
-
-        assert_eq!(
-            result,
-            DvMaskResult {
-                selection: Some(vec![true, false, true, true, true]),
-                should_remove: true,
-            }
-        );
-        assert!(sv.is_empty());
-    }
-
-    #[test]
-    fn test_dv_mask_exhaustion_across_batches() {
-        use super::{DvMaskResult, consume_dv_mask};
-
-        let file_id = "test_file.parquet".to_string();
-        let mut selection_vectors = HashMap::from([(file_id.clone(), vec![false, true])]);
-
-        let result1 = consume_dv_mask(selection_vectors.get_mut(&file_id).unwrap(), 5);
-        assert_eq!(
-            result1,
-            DvMaskResult {
-                selection: Some(vec![false, true, true, true, true]),
-                should_remove: true,
-            }
-        );
-        if result1.should_remove {
-            selection_vectors.remove(&file_id);
+    #[rstest::rstest]
+    #[case::empty(vec![], vec![2], vec![None])]
+    #[case::short(
+        vec![true, false, true], vec![5, 2],
+        vec![Some(vec![true, false, true, true, true]), None]
+    )]
+    #[case::boundaries(
+        vec![true, false, false, true], vec![2, 2, 1],
+        vec![Some(vec![true, false]), Some(vec![false, true]), None]
+    )]
+    #[case::zero_batch(
+        vec![false, true], vec![0, 1, 3],
+        vec![Some(vec![]), Some(vec![false]), Some(vec![true, true, true])]
+    )]
+    #[case::multiple_batches(
+        vec![true, false, true, false, true, true, false, true, false, true],
+        vec![3, 3, 5, 5],
+        vec![Some(vec![true, false, true]), Some(vec![false, true, true]),
+             Some(vec![false, true, false, true, true]), None]
+    )]
+    fn test_dv_mask_cursors_preserve_padding_and_batch_boundaries(
+        #[case] mask: Vec<bool>,
+        #[case] batches: Vec<usize>,
+        #[case] expected: Vec<Option<Vec<bool>>>,
+    ) {
+        for _execution in 0..2 {
+            let mut offset = 0;
+            let actual: Vec<_> = batches
+                .iter()
+                .map(|&rows| consume_dv_mask(&mask, &mut offset, rows))
+                .collect();
+            assert_eq!(actual, expected);
+            assert!(offset <= mask.len());
         }
-
-        let result2 = if let Some(sv) = selection_vectors.get_mut(&file_id) {
-            consume_dv_mask(sv, 5)
-        } else {
-            DvMaskResult {
-                selection: None,
-                should_remove: false,
-            }
-        };
-        assert_eq!(
-            result2,
-            DvMaskResult {
-                selection: None,
-                should_remove: false,
-            }
-        );
-    }
-
-    #[test]
-    fn test_dv_normal_mask_drains_exactly() {
-        use super::{DvMaskResult, consume_dv_mask};
-
-        let mut sv = vec![
-            true, false, true, false, true, true, false, true, false, true,
-        ];
-
-        let result1 = consume_dv_mask(&mut sv, 3);
-        assert_eq!(
-            result1,
-            DvMaskResult {
-                selection: Some(vec![true, false, true]),
-                should_remove: false,
-            }
-        );
-        assert_eq!(sv.len(), 7);
-
-        let result2 = consume_dv_mask(&mut sv, 3);
-        assert_eq!(
-            result2,
-            DvMaskResult {
-                selection: Some(vec![false, true, true]),
-                should_remove: false,
-            }
-        );
-        assert_eq!(sv, vec![false, true, false, true]);
-
-        let result3 = consume_dv_mask(&mut sv, 5);
-        assert_eq!(
-            result3,
-            DvMaskResult {
-                selection: Some(vec![false, true, false, true, true]),
-                should_remove: true,
-            }
-        );
-        assert!(sv.is_empty());
-
-        let result4 = consume_dv_mask(&mut sv, 5);
-        assert_eq!(
-            result4,
-            DvMaskResult {
-                selection: None,
-                should_remove: true,
-            }
-        );
-    }
-
-    #[test]
-    fn test_dv_long_mask_retains_remainder_for_next_batch() {
-        use super::{DvMaskResult, consume_dv_mask};
-
-        let mut sv = vec![true, false, false, true];
-        let result = consume_dv_mask(&mut sv, 2);
-
-        assert_eq!(
-            result,
-            DvMaskResult {
-                selection: Some(vec![true, false]),
-                should_remove: false,
-            }
-        );
-        assert_eq!(sv, vec![false, true]);
     }
 }
