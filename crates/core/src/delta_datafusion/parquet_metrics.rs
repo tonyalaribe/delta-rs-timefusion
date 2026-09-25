@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -11,7 +10,7 @@ use datafusion::{
     datasource::physical_plan::parquet::{
         CachedParquetFileReaderFactory, ParquetFileReaderFactory,
     },
-    common::TableReference,
+    common::{HashMap, TableReference},
     execution::cache::{
         Cache, CacheEntryInfo,
         cache_manager::{CachedFileMetadataEntry, FileMetadataCache},
@@ -49,11 +48,11 @@ static BYTES_PLANNED: AtomicU64 = AtomicU64::new(0);
 static SELECTED_ROW_GROUPS: AtomicU64 = AtomicU64::new(0);
 
 pub struct InstrumentedFileMetadataCache {
-    inner: Arc<dyn FileMetadataCache>,
+    inner: Arc<FileMetadataCache>,
 }
 
 impl InstrumentedFileMetadataCache {
-    pub fn new(inner: Arc<dyn FileMetadataCache>) -> Self {
+    pub fn new(inner: Arc<FileMetadataCache>) -> Self {
         Self { inner }
     }
 }
@@ -120,7 +119,7 @@ pub struct InstrumentedParquetFileReaderFactory {
 }
 
 impl InstrumentedParquetFileReaderFactory {
-    pub fn new(store: Arc<dyn ObjectStore>, metadata_cache: Arc<dyn FileMetadataCache>) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, metadata_cache: Arc<FileMetadataCache>) -> Self {
         Self {
             inner: CachedParquetFileReaderFactory::new(store, metadata_cache),
         }

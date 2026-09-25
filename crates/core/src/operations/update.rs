@@ -375,24 +375,23 @@ async fn execute(
             )?)?
             .build()?;
         let physical_plan = session.create_physical_plan(&updated_only).await?;
-        let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
         let mut actions = write_execution_plan(
-            Some(snapshot),
+            snapshot.table_configuration(),
             session,
             physical_plan,
-            table_partition_cols.to_vec(),
             log_store.object_store(Some(operation_id)).clone(),
-            Some(snapshot.table_properties().target_file_size()),
-            None,
-            writer_properties.clone(),
-            writer_stats_config,
+            WriteExecOptions {
+                target_file_size: Some(snapshot.table_properties().target_file_size()),
+                write_batch_size: None,
+                writer_properties: writer_properties.clone(),
+            },
         )
         .await?;
         let appended = actions.len();
 
         let (dv_actions, num_matched) = crate::operations::delete::deletion_vector_delete(
             session,
-            snapshot,
+            eager_snapshot,
             log_store.clone(),
             &files_scan,
         )

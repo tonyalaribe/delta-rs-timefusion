@@ -31,7 +31,7 @@ use crate::logstore::LogStoreRef;
 use crate::operations::delete::DV_ROW_INDEX_COL;
 use crate::operations::deletion_vectors::{FileDeletion, write_deletion_vectors};
 use crate::operations::write::WriterStatsConfig;
-use crate::operations::write::execution::write_execution_plan;
+use crate::operations::write::{configs::WriteExecOptions, execution::write_execution_plan};
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
@@ -277,15 +277,15 @@ async fn collect_merge_dv_actions(
             let append_plan = append_builder.build()?;
             let append_exec = session.create_physical_plan(&append_plan).await?;
             let mut appended = write_execution_plan(
-                Some(snapshot),
+                snapshot.table_configuration(),
                 session,
                 append_exec,
-                partition_cols.clone(),
                 log_store.object_store(Some(operation_id)),
-                target_size,
-                None,
-                op.writer_properties.clone(),
-                stats_config.clone(),
+                WriteExecOptions {
+                    target_file_size: target_size,
+                    write_batch_size: None,
+                    writer_properties: op.writer_properties.clone(),
+                },
             )
             .await?;
             actions.append(&mut appended);
@@ -326,7 +326,7 @@ async fn candidate_adds(
     };
     let Some(files_scan) = crate::delta_datafusion::scan_files_where_matches(
         session,
-        snapshot,
+        snapshot.snapshot(),
         log_store.clone(),
         predicate,
     )
