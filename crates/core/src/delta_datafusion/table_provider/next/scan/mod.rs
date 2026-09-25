@@ -34,7 +34,7 @@ use datafusion::{
         ColumnStatistics, HashMap, Result, Statistics, ToDFSchema, internal_datafusion_err,
         plan_err, stats::Precision,
     },
-    datasource::physical_plan::{ParquetSource, parquet::CachedParquetFileReaderFactory},
+    datasource::physical_plan::ParquetSource,
     error::DataFusionError,
     execution::object_store::ObjectStoreUrl,
     physical_expr::Partitioning,
@@ -697,10 +697,21 @@ async fn get_read_plan(
     let adapter_factory = Arc::new(DeltaPhysicalExprAdapterFactory);
 
     for (store_url, files, has_deletion_vectors) in files_by_store.into_iter() {
-        let reader_factory = Arc::new(CachedParquetFileReaderFactory::new(
-            state.runtime_env().object_store(&store_url)?,
-            state.runtime_env().cache_manager.get_file_metadata_cache(),
-        ));
+        crate::delta_datafusion::parquet_metrics::record_scan(
+            files.len(),
+            files.iter().map(|file| file.object_meta.size).sum(),
+        );
+        let metadata_cache = Arc::new(
+            crate::delta_datafusion::parquet_metrics::InstrumentedFileMetadataCache::new(
+                state.runtime_env().cache_manager.get_file_metadata_cache(),
+            ),
+        );
+        let reader_factory = Arc::new(
+            crate::delta_datafusion::parquet_metrics::InstrumentedParquetFileReaderFactory::new(
+                state.runtime_env().object_store(&store_url)?,
+                metadata_cache,
+            ),
+        );
 
         // NOTE: In the "next" provider, DataFusion's Parquet scan partition fields are file-id
         // only. Delta partition columns/values are injected via kernel transforms and handled

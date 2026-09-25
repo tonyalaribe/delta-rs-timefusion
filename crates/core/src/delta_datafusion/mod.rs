@@ -93,6 +93,7 @@ pub mod expr;
 mod file_id;
 pub(crate) mod find_files;
 pub mod logical;
+pub mod parquet_metrics;
 pub mod physical;
 pub mod planner;
 mod session;
