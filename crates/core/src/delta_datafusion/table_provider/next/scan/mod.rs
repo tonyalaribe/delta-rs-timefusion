@@ -60,6 +60,14 @@ use delta_kernel::{
 use futures::{Stream, StreamExt as _, TryStreamExt as _, future::ready};
 use itertools::Itertools as _;
 use object_store::{ObjectMeta, path::Path};
+use datafusion::{
+    common::ScalarValue,
+    datasource::physical_plan::parquet::metadata::DFParquetMetadata,
+    execution::cache::cache_manager::FileMetadataCache,
+    physical_expr::LexOrdering,
+};
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use object_store::ObjectStore;
 use tracing::debug;
 use url::Url;
 
@@ -172,6 +180,399 @@ pub(super) async fn execution_plan(
 
     get_data_scan_plan(session, scan_plan, replayed, limit, row_ordinal_selections).await
 }
+
+/// Per-file sort-column footer stats: `(column index, (min, max, null_count))` for every
+/// column of the file's declared footer ordering; `None` when some stat is unavailable.
+type FooterSortStats = Option<Vec<(usize, (ScalarValue, ScalarValue, usize))>>;
+
+/// Partition `files` by whether each one declares the scan's common ordering. Conforming
+/// files carry the claim; the rest are scanned separately with no claim at all.
+fn split_by_declared_ordering(
+    files: Vec<PartitionedFile>,
+    conforms: &[bool],
+) -> (
+    Vec<PartitionedFile>,
+    Vec<PartitionedFile>,
+) {
+    let (conforming, rest): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .enumerate()
+        .partition(|(idx, _)| conforms.get(*idx).copied().unwrap_or(false));
+    (
+        conforming.into_iter().map(|(_, file)| file).collect(),
+        rest.into_iter().map(|(_, file)| file).collect(),
+    )
+}
+
+/// The footer's sort order, truncated at the first sort column this scan cannot bind —
+/// and only when every row group agrees on it.
+///
+/// DataFusion's `ordering_from_parquet_metadata` FILTERS unbindable sort columns out and
+/// keeps the ones after them, which turns a short truth into a long lie: a file sorted by
+/// `[timestamp, service, id]`, read under a projection without `service`, is declared
+/// sorted by `[timestamp, id]` — and within one timestamp its ids do not ascend.
+///
+/// TimeFusion shipped exactly that lie. `SortingColumn.column_idx` indexes parquet LEAVES,
+/// not fields, so every file written before 2026-09-03 names `attributes___user___email`
+/// where `resource___service___name` belongs. The reader could not bind that name, dropped
+/// it, and advertised `[timestamp DESC, id ASC]` over data ordered by service — the only
+/// visible symptom being a nonzero `ordering_violations_delta`.
+///
+/// A PREFIX of a sort order is always sound (a file sorted by the full key is sorted by
+/// any prefix of it); a SUBSEQUENCE is not. So stop at the first column that does not
+/// bind instead of skipping it. Position 0 survives this for every file TimeFusion ever
+/// wrote, because the leaf/field offset cannot accumulate before the first nested column.
+fn ordering_from_footer_prefix(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    schema: &SchemaRef,
+) -> Option<LexOrdering> {
+    use arrow::compute::SortOptions;
+    use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+
+    // `sorting_columns` is per-row-group, so one row group's claim says nothing about the
+    // file as a whole. Upstream reads only the first; require unanimity instead, which can
+    // only ever shrink what we claim.
+    let mut groups = metadata.row_groups().iter().map(|rg| rg.sorting_columns());
+    let sorting_columns = groups.next().flatten().filter(|cols| !cols.is_empty())?;
+    if !groups.all(|other| other.is_some_and(|cols| cols == sorting_columns)) {
+        return None;
+    }
+
+    let parquet_schema = metadata.file_metadata().schema_descr();
+    LexOrdering::new(sorting_columns.iter().map_while(|sc| {
+        let name = parquet_schema.columns().get(sc.column_idx as usize)?.name();
+        let (index, _) = schema.column_with_name(name)?;
+        Some(PhysicalSortExpr::new(
+            Arc::new(Column::new(name, index)),
+            SortOptions {
+                descending: sc.descending,
+                nulls_first: sc.nulls_first,
+            },
+        ))
+    }))
+}
+
+/// The longest sort prefix the files AGREE on, plus which of them carry it.
+///
+/// Anchors on the ordering the plurality declared, then shortens it to the longest prefix
+/// every lead-sharing file also declares. Requiring exact equality instead made agreement
+/// all-or-nothing: a table mid-migration holds two honest-but-different footer generations,
+/// and the minority generation was isolated into an unordered sibling scan even though both
+/// are sorted by the same lead column.
+///
+/// That is the 14/30-day cliff. Prod 2026-09-04: files written before the leaf-index footer
+/// fix declare `[timestamp, id]` and files after it `[timestamp, service, id]`, so any
+/// window spanning 2026-09-03 isolated one generation or the other — ~3.1 GB on a dashboard
+/// query, 16.5 GB at 30 days. Both are far past `read_sort_unordered_leg_max_mb`, so the
+/// read-time sort repair declined, the union lost its ordering claim, and `DedupExec` fell
+/// back to its unbounded `full-set` seen-set. A 30-day `COUNT(*)` then could not finish
+/// inside a 60 s statement timeout, while the same 31 days queried one at a time summed to
+/// 28 s.
+///
+/// Shortening costs nothing when every footer already matches — the minimum IS the full
+/// length — and `[timestamp]` alone is what bounded dedup and the streaming top-N need.
+/// Files sharing no lead column agree on nothing and stay isolated, which is the case
+/// isolation exists for.
+fn agreed_ordering_prefix(per_file: &[Option<LexOrdering>]) -> Option<(LexOrdering, Vec<bool>)> {
+    let mut tally: Vec<(&LexOrdering, usize)> = Vec::new();
+    for ordering in per_file.iter().flatten() {
+        match tally
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == ordering)
+        {
+            Some((_, count)) => *count += 1,
+            None => tally.push((ordering, 1)),
+        }
+    }
+    let anchor = tally
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(ordering, _)| ordering)?;
+
+    let prefix_len = |ordering: &LexOrdering| {
+        ordering
+            .iter()
+            .zip(anchor.iter())
+            .take_while(|(lhs, rhs)| lhs == rhs)
+            .count()
+    };
+    // Only files that share the lead column constrain the claim; a file agreeing on
+    // nothing would otherwise drag the prefix to zero and cost every file its ordering.
+    let len = per_file
+        .iter()
+        .flatten()
+        .map(&prefix_len)
+        .filter(|&len| len > 0)
+        .min()?;
+    let common = LexOrdering::new(anchor.iter().take(len).cloned())?;
+    let conforms = per_file
+        .iter()
+        .map(|ordering| ordering.as_ref().is_some_and(|o| prefix_len(o) >= len))
+        .collect();
+    Some((common, conforms))
+}
+
+/// Returns the [`LexOrdering`] the **largest set** of files agree on, plus which files
+/// declare it. Previously this was all-or-nothing — every file had to declare the same
+/// non-empty parquet `sorting_columns` footer or the scan lost its ordering entirely — which
+/// meant one unsorted file (a compacted/Z-ordered output, or a flush whose sort was skipped)
+/// cost every other file its claim. The caller now isolates the non-conforming files instead.
+///
+/// Alongside the ordering, returns each file's sort-column min/max/null-count extracted from
+/// the **same** footers (indexed like `files`) — the ordering only survives DataFusion's
+/// stats-based validation when per-file stats back it, and pulling them out here keeps all
+/// footer reads in this one bounded, cache-backed pass (no further plan-time IO).
+async fn derive_common_ordering(
+    store: Arc<dyn ObjectStore>,
+    cache: Arc<FileMetadataCache>,
+    files: &[PartitionedFile],
+    read_schema: SchemaRef,
+) -> Option<(LexOrdering, Vec<FooterSortStats>, Vec<bool>)> {
+    use datafusion::physical_expr::expressions::Column;
+    // Fetch footers concurrently (bounded). On a cold metadata cache a scan can span hundreds
+    // of files; a serial loop would add that many sequential footer reads to *planning*. The
+    // cache is shared with the reader, so these reads also warm execution. The per-file futures
+    // own (Arc-clone) everything they touch so the parent scan future stays lifetime-general.
+    const FOOTER_FETCH_CONCURRENCY: usize = 16;
+    // Detach from `files` (owned ObjectMeta) before building futures so the per-file closure
+    // takes an owned value — a closure over a borrowed scan item is not lifetime-general and
+    // makes the whole scan future fail HRTB inference.
+    let object_metas: Vec<ObjectMeta> = files.iter().map(|f| f.object_meta.clone()).collect();
+    let file_count = object_metas.len();
+    let fetches = object_metas
+        .into_iter()
+        .enumerate()
+        .map(|(idx, object_meta)| {
+            let (store, cache, read_schema) = (store.clone(), cache.clone(), read_schema.clone());
+            async move {
+                let meta = DFParquetMetadata::new(store.as_ref(), &object_meta)
+                    .with_file_metadata_cache(Some(cache))
+                    .fetch_metadata()
+                    .await
+                    .ok();
+                let ordering = meta
+                    .as_ref()
+                    .and_then(|meta| ordering_from_footer_prefix(meta, &read_schema));
+                let stats: FooterSortStats =
+                    ordering
+                        .as_ref()
+                        .zip(meta.as_ref())
+                        .map(|(ordering, meta)| {
+                            ordering
+                                .iter()
+                                // Missing bounds for one column must not discard usable
+                                // leading bounds. The prefix check below remains conservative.
+                                .filter_map(|expr| {
+                                    let column = expr.expr.downcast_ref::<Column>()?.index();
+                                    sort_column_footer_stats(meta, &read_schema, column)
+                                        .map(|stats| (column, stats))
+                                })
+                                .collect()
+                        });
+                (idx, ordering, stats)
+            }
+        });
+    let results: Vec<(usize, Option<LexOrdering>, FooterSortStats)> =
+        futures::stream::iter(fetches)
+            .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+    // Claim the prefix the most files agree on, rather than bailing at the first
+    // disagreement. `conforms[i]` then says whether file i can be scanned under that
+    // claim; the caller isolates the rest into their own unordered scan instead of
+    // losing the claim for everything (see `split_by_declared_ordering`).
+    let mut per_file: Vec<Option<LexOrdering>> = vec![None; file_count];
+    let mut footer_stats: Vec<FooterSortStats> = vec![None; file_count];
+    for (idx, ordering, stats) in results {
+        per_file[idx] = ordering;
+        footer_stats[idx] = stats;
+    }
+    let (common, conforms) = agreed_ordering_prefix(&per_file)?;
+    Some((common, footer_stats, conforms))
+}
+
+/// Upper bound on file groups produced when repacking for a declared ordering. Heavily
+/// overlapping files (deep merge-on-read update chains) would otherwise degenerate into one
+/// single-file group per file, and a SortPreservingMergeExec over that many concurrent
+/// parquet streams costs more than the ordering claim is worth.
+const MAX_ORDERED_FILE_GROUPS: usize = 512;
+
+/// Repack `file_groups` so a declared `ordering` survives DataFusion's per-group validation
+/// (`FileScanConfig::validated_output_ordering`): a multi-file group only validates when its
+/// files are non-overlapping in the sort key min/max stats AND listed in sort order. The
+/// default snapshot-order grouping violates this as soon as files overlap in the lead key,
+/// silently dropping the claim — and with it TopK streaming and bounded dedup upstream.
+///
+/// Delegates to DataFusion's own stats-based first-fit packer with the previous group count
+/// as the target: disjoint runs stay packed together (parallelism and the dictionary-key
+/// cardinality bound are preserved), while mutually overlapping files spill into their own
+/// groups, which validate trivially. Falls back to the original grouping when stats are
+/// unusable or the result would be degenerate — the declared ordering then dies in
+/// validation exactly as before this repacking existed.
+fn regroup_for_declared_ordering(
+    file_groups: Vec<FileGroup>,
+    ordering: &LexOrdering,
+    table_schema: &SchemaRef,
+    target_partitions: usize,
+) -> Vec<FileGroup> {
+    // WIDEN ONLY. This used to pass `file_groups.len()`, pinning the scan's
+    // parallelism to whatever grouping the Delta snapshot happened to arrive
+    // with — 21 groups on a 30-day prod window, on a 48-core box whose session
+    // `target_partitions` is 48. Each group is one sequential reader, so that
+    // capped IN-QUERY read concurrency at 21 regardless of available cores.
+    //
+    // It is why two client sessions beat one query on the same work: prod
+    // 2026-09-04, two concurrent 15-day queries ran 11.8/21.3/14.6 s against
+    // 37.8/43.0/30.2 s for the single 30-day query — ~3x, purely from having
+    // ~44 reads in flight instead of ~21. The scan is IO-bound (container CPU
+    // is identical with and without the query), so reads in flight IS the
+    // throughput.
+    //
+    // Never NARROW below the incoming grouping: fewer groups would merge files
+    // back together, and a group is only valid while its files stay
+    // non-overlapping in the sort key.
+    let target_partitions = target_partitions.max(file_groups.len()).max(1);
+    match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+        table_schema,
+        &file_groups,
+        ordering,
+        target_partitions,
+    ) {
+        Ok(groups)
+            if groups.len() <= MAX_ORDERED_FILE_GROUPS
+                && groups
+                    .iter()
+                    .all(|group| group.len() <= MAX_PARTITION_DICT_CARDINALITY) =>
+        {
+            groups
+        }
+        Ok(groups) => {
+            debug!(
+                groups = groups.len(),
+                "keeping snapshot-order file groups; ordered repacking was degenerate"
+            );
+            file_groups
+        }
+        Err(err) => {
+            debug!(
+                error = %err,
+                "keeping snapshot-order file groups; ordering claim will not survive validation"
+            );
+            file_groups
+        }
+    }
+}
+
+/// Merge footer-derived sort-column stats into each file's DataFusion statistics, filling
+/// gaps only — Delta add-file stats, when present, stay authoritative. Purely in-memory: the
+/// footers were already read by [`derive_common_ordering`], this does no IO.
+///
+/// DataFusion validates a declared output ordering against per-file min/max statistics, but
+/// Delta stats are only materialized for predicate columns, so sort columns (e.g. a tiebreak
+/// id) are typically `Absent` and every multi-file group would fail validation. Footer
+/// min/max may be truncated bounds (strings), hence `Inexact` — still a valid bound for the
+/// non-overlap check.
+fn apply_footer_sort_stats(
+    files: &mut [PartitionedFile],
+    footer_stats: Vec<FooterSortStats>,
+    read_schema: &SchemaRef,
+) {
+    for (file, per_column) in files.iter_mut().zip(footer_stats) {
+        let Some(per_column) = per_column else {
+            continue;
+        };
+        let stats = file
+            .statistics
+            .get_or_insert_with(|| Arc::new(Statistics::new_unknown(read_schema)));
+        let stats = Arc::make_mut(stats);
+        for (column, (min, max, null_count)) in per_column {
+            let Some(column_stats) = stats.column_statistics.get_mut(column) else {
+                continue;
+            };
+            if column_stats.min_value.get_value().is_none() {
+                column_stats.min_value = Precision::Inexact(min);
+            }
+            if column_stats.max_value.get_value().is_none() {
+                column_stats.max_value = Precision::Inexact(max);
+            }
+            if !matches!(column_stats.null_count, Precision::Exact(_)) {
+                column_stats.null_count = Precision::Exact(null_count);
+            }
+        }
+    }
+}
+
+/// Longest prefix of `ordering` for which **every** file carries min/max stats on a plain
+/// column — the largest claim DataFusion's stats-based validation can actually confirm.
+/// Zero means not even the lead column is stats-backed everywhere.
+fn stats_backed_prefix_len(
+    files: &[PartitionedFile],
+    ordering: &LexOrdering,
+) -> usize {
+    use datafusion::physical_expr::expressions::Column;
+    ordering
+        .iter()
+        .take_while(|expr| {
+            expr.expr.downcast_ref::<Column>().is_some_and(|column| {
+                files.iter().all(|file| {
+                    file.statistics.as_ref().is_some_and(|stats| {
+                        stats
+                            .column_statistics
+                            .get(column.index())
+                            .is_some_and(|cs| {
+                                cs.min_value.get_value().is_some()
+                                    && cs.max_value.get_value().is_some()
+                            })
+                    })
+                })
+            })
+        })
+        .count()
+}
+
+/// (min, max, null_count) of one column across all row groups, from footer statistics.
+/// `None` when any row group lacks the stat (a partial bound is not a bound) or the file has
+/// no row groups.
+fn sort_column_footer_stats(
+    meta: &parquet::file::metadata::ParquetMetaData,
+    read_schema: &SchemaRef,
+    column_index: usize,
+) -> Option<(ScalarValue, ScalarValue, usize)> {
+    use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+    let converter = StatisticsConverter::try_new(
+        read_schema.field(column_index).name(),
+        read_schema,
+        meta.file_metadata().schema_descr(),
+    )
+    .ok()?;
+    let row_groups = meta.row_groups();
+    let mins = converter.row_group_mins(row_groups.iter()).ok()?;
+    let maxes = converter.row_group_maxes(row_groups.iter()).ok()?;
+    let null_counts = converter.row_group_null_counts(row_groups.iter()).ok()?;
+    let min = scalar_extreme(&mins, std::cmp::Ordering::Less)?;
+    let max = scalar_extreme(&maxes, std::cmp::Ordering::Greater)?;
+    let null_count = null_counts.iter().try_fold(0usize, |acc, count| {
+        Some(acc + usize::try_from(count?).ok()?)
+    })?;
+    Some((min, max, null_count))
+}
+
+/// Fold per-row-group stats into a single extreme (`Less` → min, `Greater` → max); `None` on
+/// empty input, a missing (null) row-group stat, or incomparable values.
+fn scalar_extreme(array: &ArrayRef, keep: std::cmp::Ordering) -> Option<ScalarValue> {
+    (0..array.len()).try_fold(None::<ScalarValue>, |best, i| {
+        if array.is_null(i) {
+            return None;
+        }
+        let value = ScalarValue::try_from_array(array, i).ok()?;
+        Some(Some(match best {
+            Some(best) if value.partial_cmp(&best)? != keep => best,
+            _ => value,
+        }))
+    })?
+}
+
 
 /// Attach a [`ParquetAccessPlan`] selecting exactly the requested row ordinals to each
 /// matching file. Footer fetch failures and out-of-range ordinals leave the file read in full.
@@ -823,19 +1224,20 @@ async fn get_read_plan(
     let adapter_factory = Arc::new(DeltaPhysicalExprAdapterFactory);
 
     for (store_url, files, has_deletion_vectors) in files_by_store.into_iter() {
+        let object_store = state.runtime_env().object_store(&store_url)?;
         crate::delta_datafusion::parquet_metrics::record_scan(
             files.len(),
             files.iter().map(|file| file.object_meta.size).sum(),
         );
-        let metadata_cache = Arc::new(
+        let metadata_cache: Arc<FileMetadataCache> = Arc::new(
             crate::delta_datafusion::parquet_metrics::InstrumentedFileMetadataCache::new(
                 state.runtime_env().cache_manager.get_file_metadata_cache(),
             ),
         );
         let reader_factory = Arc::new(
             crate::delta_datafusion::parquet_metrics::InstrumentedParquetFileReaderFactory::new(
-                state.runtime_env().object_store(&store_url)?,
-                metadata_cache,
+                object_store.clone(),
+                metadata_cache.clone(),
             ),
         );
 
@@ -846,7 +1248,9 @@ async fn get_read_plan(
             .with_table_partition_cols(vec![file_id_field.clone()])
             .build();
         let full_table_schema = table_schema.table_schema().clone();
+        // Positional deletion-vector masks require physical file order.
         let mut file_source = ParquetSource::new(table_schema)
+            .with_repartitioning(!has_deletion_vectors)
             .with_table_parquet_options(pq_options.clone())
             .with_parquet_file_reader_factory(reader_factory);
 
@@ -854,64 +1258,102 @@ async fn get_read_plan(
         // by creating parquet access plans. However we need to make sure this does not
         // interfere with other delta features like row ids.
         if !has_deletion_vectors && let Some(pred) = predicate {
-            match state.create_physical_expr(pred.clone(), &parquet_predicate_df_schema) {
-                Ok(physical) => match adapter_factory
-                    .create(parquet_predicate_schema.clone(), full_read_schema.clone())
-                {
-                    Ok(adapter) => match adapter.rewrite(physical) {
-                        Ok(rewritten) => {
-                            file_source = file_source
-                                .with_predicate(rewritten)
-                                .with_pushdown_filters(true);
-                        }
-                        Err(err) => {
-                            debug!(
-                                predicate = ?pred,
-                                schema = ?parquet_predicate_schema,
-                                error = %err,
-                                "Skipping parquet predicate pushdown because predicate adaptation to the read schema failed"
-                            );
-                        }
-                    },
-                    Err(err) => {
-                        debug!(
-                            predicate = ?pred,
-                            schema = ?parquet_predicate_schema,
-                            error = %err,
-                            "Skipping parquet predicate pushdown because predicate adapter creation failed"
-                        );
+            // One non-convertible conjunct (e.g. a UDF like `text_match`) must not discard the
+            // whole parquet predicate: bind each top-level AND term independently and push the
+            // survivors. Pushdown is Inexact, so dropping a term only loses an optimization.
+            match adapter_factory.create(parquet_predicate_schema.clone(), full_read_schema.clone()) {
+                Ok(adapter) => {
+                    let rewritten = datafusion::logical_expr::utils::split_conjunction(pred)
+                        .into_iter()
+                        .filter_map(|term| {
+                            state
+                                .create_physical_expr(term.clone(), &parquet_predicate_df_schema)
+                                .and_then(|physical| adapter.rewrite(physical))
+                                .map_err(|err| debug!(term = ?term, error = %err, "Skipping one parquet predicate conjunct that failed to bind or adapt"))
+                                .ok()
+                        })
+                        .reduce(|l, r| {
+                            Arc::new(datafusion::physical_plan::expressions::BinaryExpr::new(
+                                l,
+                                datafusion::logical_expr::Operator::And,
+                                r,
+                            )) as _
+                        });
+                    match rewritten {
+                        Some(expr) => file_source = file_source.with_predicate(expr).with_pushdown_filters(true),
+                        None => debug!(predicate = ?pred, "Skipping parquet predicate pushdown: no conjunct could be bound"),
                     }
-                },
-                Err(err) => {
-                    debug!(
-                        predicate = ?pred,
-                        schema = ?parquet_predicate_schema,
-                        error = %err,
-                        "Skipping parquet predicate pushdown because predicate binding failed"
-                    );
                 }
+                Err(err) => debug!(
+                    predicate = ?pred,
+                    schema = ?parquet_predicate_schema,
+                    error = %err,
+                    "Skipping parquet predicate pushdown because predicate adapter creation failed"
+                ),
             }
         }
 
-        let file_groups = partitioned_files_to_file_groups(files);
-        let (file_groups, statistics) =
-            compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
-
-        let file_group_count = file_groups.len();
-        let builder = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
-            .with_file_groups(file_groups)
-            .with_statistics(statistics)
-            .with_limit(if has_deletion_vectors { None } else { limit })
-            .with_expr_adapter(Some(adapter_factory.clone() as _));
-        let builder = if has_deletion_vectors {
-            builder
-                .with_output_partitioning(Some(Partitioning::UnknownPartitioning(file_group_count)))
-        } else {
-            builder
+        // Derive a scan-wide output ordering from the parquet footers (cache-backed: the reader
+        // fetches the same footers anyway). Files that do not declare it are isolated into an
+        // unordered sibling leg instead of voiding the claim for the whole scan, and only the
+        // longest sort prefix every conforming file has stats for is declared, so DataFusion's
+        // per-group validation keeps it.
+        let derived_ordering =
+            derive_common_ordering(object_store.clone(), metadata_cache.clone(), &files, parquet_read_schema.clone()).await;
+        let footer_ordering = derived_ordering.as_ref().map(|(ordering, _, _)| ordering.clone());
+        let mut files = files;
+        let (mut files, mut unordered_files, output_ordering, regroup) = match derived_ordering {
+            Some((ordering, footer_stats, conforms)) => {
+                apply_footer_sort_stats(&mut files, footer_stats, parquet_read_schema);
+                let (conforming, rest) = split_by_declared_ordering(files, &conforms);
+                let (ordering, regroup) = match stats_backed_prefix_len(&conforming, &ordering) {
+                    0 => (Some(ordering), false),
+                    len => (LexOrdering::new(ordering.iter().take(len).cloned()), true),
+                };
+                (conforming, rest, ordering, regroup)
+            }
+            None => (files, Vec::new(), None, false),
         };
-        let config = builder.build();
+        if output_ordering.is_none() && !unordered_files.is_empty() {
+            files.append(&mut unordered_files);
+        }
 
-        plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
+        let file_groups = partitioned_files_to_file_groups(files);
+        // Snapshot-order groups rarely validate under merge-on-read, so repack when a
+        // stats-backed prefix is declared; otherwise keep the grouping as-is.
+        let file_groups = match &output_ordering {
+            Some(ordering) if regroup => {
+                regroup_for_declared_ordering(file_groups, ordering, &full_table_schema, state.config().target_partitions())
+            }
+            _ => file_groups,
+        };
+        let data_source = |file_groups: Vec<FileGroup>, ordering: Option<Vec<LexOrdering>>| -> Result<Arc<dyn ExecutionPlan>> {
+            let (file_groups, statistics) = compute_all_files_statistics(file_groups, full_table_schema.clone(), true, false)?;
+            let file_group_count = file_groups.len();
+            let mut builder = FileScanConfigBuilder::new(store_url.clone(), Arc::new(file_source.clone()))
+                .with_file_groups(file_groups)
+                .with_statistics(statistics)
+                .with_limit(if has_deletion_vectors { None } else { limit })
+                .with_expr_adapter(Some(adapter_factory.clone() as _));
+            if has_deletion_vectors {
+                builder = builder.with_output_partitioning(Some(Partitioning::UnknownPartitioning(file_group_count)));
+            }
+            if let Some(orderings) = ordering {
+                // Auto-enables `preserve_order`: groups merge with a SortPreservingMergeExec.
+                builder = builder.with_output_ordering(orderings);
+            }
+            Ok(DataSourceExec::from_data_source(builder.build()) as Arc<dyn ExecutionPlan>)
+        };
+        // Keep the complete footer claim as a candidate too: single-file groups validate it
+        // without bounds on secondary columns; the stats-backed prefix is the fallback.
+        let orderings = output_ordering.map(|ordering| match footer_ordering {
+            Some(footer) if footer != ordering => vec![footer, ordering],
+            _ => vec![ordering],
+        });
+        plans.push(data_source(file_groups, orderings)?);
+        if !unordered_files.is_empty() {
+            plans.push(data_source(partitioned_files_to_file_groups(unordered_files), None)?);
+        }
     }
 
     Ok(match plans.len() {
@@ -1065,6 +1507,396 @@ mod tests {
         assert_eq!(groups[1].len(), 1);
     }
 
+    fn ts_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]))
+    }
+
+    fn ts_ordering(descending: bool) -> LexOrdering {
+        use arrow_schema::SortOptions;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+        LexOrdering::new([PhysicalSortExpr::new(
+            Arc::new(Column::new("ts", 0)),
+            SortOptions {
+                descending,
+                nulls_first: false,
+            },
+        )])
+        .unwrap()
+    }
+
+    fn ordered_file(path: &str, min: i64, max: i64) -> PartitionedFile {
+        let mut file = PartitionedFile::new(format!("memory:///{path}.parquet"), 0);
+        file.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(1),
+            total_byte_size: Precision::Exact(0),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(min))),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
+                ..ColumnStatistics::new_unknown()
+            }],
+        }));
+        file
+    }
+
+    fn group_ranges(group: &FileGroup) -> Vec<(i64, i64)> {
+        group
+            .iter()
+            .map(|file| {
+                let stats = file.statistics.as_ref().expect("file stats");
+                let value = |precision: &Precision<ScalarValue>| match precision.get_value() {
+                    Some(ScalarValue::Int64(Some(v))) => *v,
+                    other => panic!("unexpected stat {other:?}"),
+                };
+                (
+                    value(&stats.column_statistics[0].min_value),
+                    value(&stats.column_statistics[0].max_value),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_regroup_overlapping_files_yields_validating_groups() {
+        // Merge-on-read shape: an UPDATE appended old timestamps into a new file, so the
+        // lead-key ranges overlap and snapshot-order grouping can never validate.
+        let files = vec![
+            ordered_file("a", 0, 100),
+            ordered_file("b", 50, 150),
+            ordered_file("c", 120, 200),
+        ];
+        let groups = partitioned_files_to_file_groups(files);
+        assert_eq!(groups.len(), 1);
+
+        let regrouped = regroup_for_declared_ordering(groups, &ts_ordering(true), &ts_schema(), 0);
+
+        let total: usize = regrouped.iter().map(FileGroup::len).sum();
+        assert_eq!(total, 3, "no file may be lost or duplicated");
+        assert!(
+            regrouped.len() >= 2,
+            "overlapping files cannot share one group"
+        );
+        for group in &regrouped {
+            // Every multi-file group must be strictly non-overlapping and listed in the
+            // declared (DESC) order — exactly what DataFusion's validator re-checks.
+            for window in group_ranges(group).windows(2) {
+                let [(prev_min, _), (_, next_max)] = window else {
+                    unreachable!()
+                };
+                assert!(
+                    prev_min > next_max,
+                    "group files overlap or are misordered: {window:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_regroup_disjoint_files_stay_packed_in_declared_order() {
+        let files = vec![
+            ordered_file("mid", 10, 19),
+            ordered_file("hi", 20, 29),
+            ordered_file("lo", 0, 9),
+        ];
+
+        let asc = regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files.clone()),
+            &ts_ordering(false),
+            &ts_schema(),
+            0,
+        );
+        assert_eq!(asc.len(), 1, "disjoint files must not fan out into singles");
+        assert_eq!(group_ranges(&asc[0]), vec![(0, 9), (10, 19), (20, 29)]);
+
+        let desc = regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files),
+            &ts_ordering(true),
+            &ts_schema(),
+            0,
+        );
+        assert_eq!(desc.len(), 1);
+        assert_eq!(group_ranges(&desc[0]), vec![(20, 29), (10, 19), (0, 9)]);
+    }
+
+    #[test]
+    fn test_regroup_missing_stats_keeps_original_grouping() {
+        let mut no_stats = ordered_file("b", 50, 150);
+        no_stats.statistics = None;
+        let files = vec![
+            ordered_file("a", 0, 100),
+            no_stats,
+            ordered_file("c", 120, 200),
+        ];
+        let groups = partitioned_files_to_file_groups(files);
+
+        let regrouped =
+            regroup_for_declared_ordering(groups.clone(), &ts_ordering(true), &ts_schema(), 0);
+
+        let paths = |groups: &[FileGroup]| {
+            groups
+                .iter()
+                .map(|g| {
+                    g.iter()
+                        .map(|f| f.object_meta.location.to_string())
+                        .collect_vec()
+                })
+                .collect_vec()
+        };
+        assert_eq!(paths(&regrouped), paths(&groups));
+    }
+
+    /// `[(column, descending)]` -> a `LexOrdering`, so a case table reads as the footer
+    /// generations it stands for.
+    fn ordering_of(cols: &[(&str, bool)]) -> Option<LexOrdering> {
+        use arrow::compute::SortOptions;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+        LexOrdering::new(cols.iter().enumerate().map(|(idx, (name, descending))| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, idx)),
+                SortOptions {
+                    descending: *descending,
+                    nulls_first: *descending,
+                },
+            )
+        }))
+    }
+
+    /// THE 14/30-day cliff, as a table. The prod shape is the third case: two honest footer
+    /// generations either side of the leaf-index fix, agreeing only on `timestamp`. Before
+    /// this, exact equality isolated a whole generation — 3.1 GB on a dashboard query, past
+    /// every read-time sort budget — and `DedupExec` fell to `full-set`.
+    #[test]
+    fn test_agreed_ordering_prefix_keeps_every_generation_under_the_shared_prefix() {
+        let legacy = &[("timestamp", true), ("id", false)][..];
+        let modern = &[("timestamp", true), ("service", false), ("id", false)][..];
+
+        for (name, files, want_len, want_conforms) in [
+            // Unanimous footers must be untouched: the minimum IS the full length, so a
+            // homogeneous table keeps the long claim it has today.
+            ("all modern", vec![modern, modern], 3, vec![true, true]),
+            ("all legacy", vec![legacy, legacy], 2, vec![true, true]),
+            // Mixed: claim `[timestamp]`, and BOTH generations conform (nothing isolated).
+            (
+                "mixed generations",
+                vec![modern, legacy, modern],
+                1,
+                vec![true, true, true],
+            ),
+        ] {
+            let per_file: Vec<_> = files.iter().map(|cols| ordering_of(cols)).collect();
+            let (common, conforms) =
+                agreed_ordering_prefix(&per_file).expect("a claim must survive");
+            assert_eq!(common.len(), want_len, "{name}: claimed prefix length");
+            assert_eq!(conforms, want_conforms, "{name}: conformance");
+        }
+    }
+
+    /// A file agreeing on NOTHING must be isolated, not allowed to drag the shared prefix
+    /// to zero — that would cost every other file its claim, which is the failure the
+    /// isolation split exists to prevent.
+    #[test]
+    fn test_agreed_ordering_prefix_isolates_a_file_sharing_no_lead_column() {
+        let per_file = vec![
+            ordering_of(&[("timestamp", true), ("id", false)]),
+            ordering_of(&[("timestamp", true), ("id", false)]),
+            ordering_of(&[("other", false)]),
+            None,
+        ];
+
+        let (common, conforms) = agreed_ordering_prefix(&per_file).expect("a claim survives");
+
+        assert_eq!(common.len(), 2, "the majority keeps its full claim");
+        assert_eq!(
+            conforms,
+            vec![true, true, false, false],
+            "the rogue file and the footer-less file are isolated"
+        );
+    }
+
+    /// A scan's parallelism must follow the SESSION, not whatever grouping the
+    /// snapshot arrived with. Each group is one sequential reader, so pinning the
+    /// target to `file_groups.len()` capped in-query read concurrency at 21 on a
+    /// 48-core prod box — the measured reason two client sessions beat one query
+    /// ~3x on the same 30 days of IO-bound work.
+    #[test]
+    fn test_regroup_widens_to_target_partitions_but_never_narrows() {
+        // Disjoint files pack into ONE group when nothing forces a split...
+        let files = vec![
+            ordered_file("a", 0, 9),
+            ordered_file("b", 10, 19),
+            ordered_file("c", 20, 29),
+            ordered_file("d", 30, 39),
+        ];
+        let packed = regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files.clone()),
+            &ts_ordering(false),
+            &ts_schema(),
+            0,
+        );
+        assert_eq!(packed.len(), 1, "baseline: disjoint files pack together");
+
+        // ...and asking for more partitions must spread them for concurrency,
+        // without losing or duplicating a single file.
+        let widened = regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files.clone()),
+            &ts_ordering(false),
+            &ts_schema(),
+            4,
+        );
+        assert!(
+            widened.len() > packed.len(),
+            "a higher target must fan out, got {} group(s)",
+            widened.len()
+        );
+        assert_eq!(
+            widened.iter().map(FileGroup::len).sum::<usize>(),
+            files.len(),
+            "no file lost or duplicated"
+        );
+
+        // Never NARROW: a target below the incoming grouping would merge files
+        // back together, and a group is only valid while its files stay
+        // non-overlapping in the sort key.
+        let overlapping = vec![ordered_file("x", 0, 100), ordered_file("y", 50, 150)];
+        let incoming = partitioned_files_to_file_groups(overlapping);
+        let forced =
+            regroup_for_declared_ordering(incoming.clone(), &ts_ordering(false), &ts_schema(), 1);
+        assert!(
+            forced.len() >= incoming.len(),
+            "overlapping files must not be merged by a low target"
+        );
+    }
+
+    #[test]
+    fn test_stats_backed_prefix_len_stops_at_first_column_without_stats() {
+        use arrow_schema::SortOptions;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
+
+        // Two sort columns; only the lead one (ts) has min/max stats — the merge-on-read case where
+        // the tiebreak id is not a predicate column so Delta never materializes its stats.
+        let ordering = LexOrdering::new([
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("ts", 0)),
+                SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            ),
+            PhysicalSortExpr::new(Arc::new(Column::new("id", 1)), SortOptions::default()),
+        ])
+        .unwrap();
+        let files = vec![ordered_file("a", 0, 100), ordered_file("b", 50, 150)];
+        assert_eq!(stats_backed_prefix_len(&files, &ordering), 1);
+
+        // A single file without stats disables even the lead column.
+        let mut no_stats = ordered_file("c", 120, 200);
+        no_stats.statistics = None;
+        let mut files = files;
+        files.push(no_stats);
+        assert_eq!(stats_backed_prefix_len(&files, &ordering), 0);
+    }
+
+    #[test]
+    fn test_declared_ordering_survives_validation_after_regroup() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = ts_schema();
+        let ordering = ts_ordering(true);
+        let files = vec![
+            ordered_file("a", 0, 100),
+            ordered_file("b", 50, 150),
+            ordered_file("c", 120, 200),
+        ];
+        let build_plan = |groups: Vec<FileGroup>| -> Arc<dyn ExecutionPlan> {
+            let source = ParquetSource::new(TableSchema::new(schema.clone(), vec![]));
+            let config = FileScanConfigBuilder::new(
+                ObjectStoreUrl::parse("memory:///").unwrap(),
+                Arc::new(source),
+            )
+            .with_file_groups(groups)
+            .with_output_ordering(vec![ordering.clone()])
+            .build();
+            DataSourceExec::from_data_source(config)
+        };
+
+        // Snapshot-order grouping: DataFusion's stats re-validation silently drops the claim.
+        let naive = build_plan(partitioned_files_to_file_groups(files.clone()));
+        assert!(
+            naive.output_ordering().is_none(),
+            "overlapping files in one group must invalidate the declared ordering"
+        );
+
+        // Repacked grouping: the same declaration survives validation.
+        let repacked = build_plan(regroup_for_declared_ordering(
+            partitioned_files_to_file_groups(files),
+            &ordering,
+            &schema,
+            0,
+        ));
+        assert!(
+            repacked.output_ordering().is_some(),
+            "repacked groups must keep the declared ordering through validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_null_secondary_sort_column_retains_leading_footer_stats() -> TestResult {
+        use parquet::file::{metadata::SortingColumn, properties::WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![20, 10])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+            ],
+        )?;
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(Some(vec![
+                SortingColumn {
+                    column_idx: 0,
+                    descending: true,
+                    nulls_first: false,
+                },
+                SortingColumn {
+                    column_idx: 1,
+                    descending: false,
+                    nulls_first: false,
+                },
+            ]))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("null-secondary.parquet");
+        store.put(&path, buffer.into()).await?;
+        let mut files = vec![PartitionedFile::from(store.head(&path).await?)];
+        let session = create_session().into_inner();
+        let (ordering, stats, _) = derive_common_ordering(
+            store,
+            session
+                .runtime_env()
+                .cache_manager
+                .get_file_metadata_cache(),
+            &files,
+            schema.clone(),
+        )
+        .await
+        .expect("sorted footer");
+        apply_footer_sort_stats(&mut files, stats, &schema);
+        assert_eq!(
+            stats_backed_prefix_len(&files, &ordering),
+            1,
+            "missing secondary bounds must not erase valid leading bounds"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_access_plan_for_ordinals() {
         use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
@@ -1140,6 +1972,7 @@ mod tests {
             engine,
             None,
             Some(&selection),
+            None,
         )
         .await?;
 
