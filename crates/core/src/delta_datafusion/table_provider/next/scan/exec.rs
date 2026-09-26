@@ -289,8 +289,9 @@ impl DeltaScanExec {
             }
             let Some(source_exec) = plan.downcast_ref::<DataSourceExec>() else {
                 return plan_err!(
-                    "DeltaScanExec rejects node {} during sequential deletion vector scans",
-                    plan.name()
+                    "DeltaScanExec rejects node {} during sequential deletion vector scans:\n{}",
+                    plan.name(),
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
                 );
             };
             let Some(config) = source_exec.data_source().downcast_ref::<FileScanConfig>() else {
@@ -491,8 +492,9 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn supports_sort_pushdown(&self) -> bool {
-        // Physical masks and row ordinals depend on the reader's row sequence: keeping an
-        // existing ordering is safe, inserting a new sort below this boundary is not.
+        // The output schema is a transform of the input's, so a requirement cannot be pushed
+        // through by column index; and physical masks and row ordinals depend on the reader's
+        // row sequence. Keeping an existing ordering is safe, inserting a sort below is not.
         false
     }
 
