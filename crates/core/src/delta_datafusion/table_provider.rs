@@ -284,6 +284,7 @@ pub struct TableProviderBuilder {
     file_selection: Option<next::FileSelection>,
     /// Opt in to parquet pushdown even under Deletion Vectors (read-only scans).
     pushdown_with_deletion_vectors: bool,
+    row_ordinal_selections: Option<std::collections::HashMap<String, Vec<u64>>>,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -319,6 +320,7 @@ impl TableProviderBuilder {
             file_skipping_predicates: None,
             file_selection: None,
             pushdown_with_deletion_vectors: false,
+            row_ordinal_selections: None,
         }
     }
 
@@ -372,7 +374,7 @@ impl TableProviderBuilder {
     }
 
     /// Add a row index column to scan output.
-    pub(crate) fn with_row_index_column(mut self, row_index_column: impl ToString) -> Self {
+    pub fn with_row_index_column(mut self, row_index_column: impl ToString) -> Self {
         self.row_index_column = Some(row_index_column.to_string());
         self
     }
@@ -413,6 +415,12 @@ impl TableProviderBuilder {
         self
     }
 
+    /// See [`next::DeltaScan::with_row_ordinal_selections`].
+    pub fn with_row_ordinal_selections(mut self, selections: std::collections::HashMap<String, Vec<u64>>) -> Self {
+        self.row_ordinal_selections = Some(selections);
+        self
+    }
+
     /// Consume the builder and resolve it into an executable [`next::DeltaScan`].
     pub async fn build(self) -> Result<next::DeltaScan> {
         let TableProviderBuilder {
@@ -425,6 +433,7 @@ impl TableProviderBuilder {
             file_skipping_predicates,
             file_selection,
             pushdown_with_deletion_vectors,
+            row_ordinal_selections,
         } = self;
 
         let mut config = session
@@ -500,6 +509,9 @@ impl TableProviderBuilder {
 
         if let Some(selection) = file_selection {
             provider = provider.with_file_selection(selection);
+        }
+        if let Some(selections) = row_ordinal_selections {
+            provider = provider.with_row_ordinal_selections(selections);
         }
 
         Ok(provider)

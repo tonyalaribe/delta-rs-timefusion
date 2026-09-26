@@ -57,7 +57,7 @@ use delta_kernel::{
     Engine, Expression, engine::arrow_data::ArrowEngineData, expressions::StructData,
     scan::ScanMetadata, table_features::TableFeature,
 };
-use futures::{Stream, TryStreamExt as _, future::ready};
+use futures::{Stream, StreamExt as _, TryStreamExt as _, future::ready};
 use itertools::Itertools as _;
 use object_store::{ObjectMeta, path::Path};
 use tracing::debug;
@@ -113,6 +113,7 @@ pub(super) async fn execution_plan(
     engine: Arc<dyn Engine>,
     limit: Option<usize>,
     file_selection: Option<&ResolvedFileSelection>,
+    row_ordinal_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(selection) = file_selection
         && selection.active_file_ids.is_empty()
@@ -169,7 +170,118 @@ pub(super) async fn execution_plan(
         }
     }
 
-    get_data_scan_plan(session, scan_plan, replayed, limit).await
+    get_data_scan_plan(session, scan_plan, replayed, limit, row_ordinal_selections).await
+}
+
+/// Attach a [`ParquetAccessPlan`] selecting exactly the requested row ordinals to each
+/// matching file. Footer fetch failures and out-of-range ordinals leave the file read in full.
+async fn attach_row_ordinal_access_plans(
+    session: &dyn Session,
+    files: &mut [(ObjectStoreUrl, PartitionedFile)],
+    selections: &std::collections::HashMap<String, Vec<u64>>,
+) -> Result<()> {
+    use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
+    const FOOTER_FETCH_CONCURRENCY: usize = 16;
+    let cache = session.runtime_env().cache_manager.get_file_metadata_cache();
+    let matched = files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (url, file))| {
+            let location = file.object_meta.location.as_ref();
+            selections
+                .iter()
+                .find(|(key, _)| path_matches_table_relative(location, key))
+                .map(|(_, ordinals)| {
+                    Ok::<_, DataFusionError>((
+                        idx,
+                        session.runtime_env().object_store(url)?,
+                        file.object_meta.clone(),
+                        ordinals.clone(),
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Futures must own everything they touch: a closure over borrowed data is not
+    // lifetime-general and fails HRTB inference in the enclosing scan future.
+    let fetches: Vec<_> = matched
+        .into_iter()
+        .map(|(idx, store, meta, ordinals)| {
+            let cache = cache.clone();
+            async move {
+            let footer = DFParquetMetadata::new(store.as_ref(), &meta)
+                .with_file_metadata_cache(Some(cache))
+                .fetch_metadata()
+                .await
+                .ok()?;
+            let rg_rows: Vec<i64> = footer.row_groups().iter().map(|rg| rg.num_rows()).collect();
+            access_plan_for_ordinals(&rg_rows, &ordinals).map(|plan| (idx, plan))
+            }
+        })
+        .collect();
+    let plans: Vec<_> = futures::stream::iter(fetches).buffer_unordered(FOOTER_FETCH_CONCURRENCY).collect().await;
+    for (idx, plan) in plans.into_iter().flatten() {
+        files[idx].1.extensions.insert(plan);
+    }
+    Ok(())
+}
+
+/// Match a store-rooted object path against a table-relative parquet path on a full
+/// path-segment boundary.
+fn path_matches_table_relative(location: &str, key: &str) -> bool {
+    !key.is_empty()
+        && location.ends_with(key)
+        && (location.len() == key.len() || location.as_bytes()[location.len() - key.len() - 1] == b'/')
+}
+
+/// A [`ParquetAccessPlan`] selecting exactly the given global row ordinals, given per
+/// row-group row counts; row groups with no ordinal are skipped. `None` when any ordinal is
+/// out of range, so a selection can only over-select (whole-file fallback), never under-select.
+fn access_plan_for_ordinals(
+    rg_row_counts: &[i64],
+    ordinals: &[u64],
+) -> Option<datafusion::datasource::physical_plan::parquet::ParquetAccessPlan> {
+    use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
+    use parquet::arrow::arrow_reader::RowSelector;
+
+    let total_rows: u64 = rg_row_counts.iter().map(|&n| n.max(0) as u64).sum();
+    let mut ordinals = ordinals.to_vec();
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    if ordinals.last().is_some_and(|&ordinal| ordinal >= total_rows) {
+        return None;
+    }
+    let mut plan = ParquetAccessPlan::new_none(rg_row_counts.len());
+    let (mut offset, mut idx) = (0u64, 0usize);
+    for (rg_idx, &rg_rows) in rg_row_counts.iter().enumerate() {
+        let rg_rows = rg_rows.max(0) as u64;
+        let rg_end = offset + rg_rows;
+        let start = idx;
+        while idx < ordinals.len() && ordinals[idx] < rg_end {
+            idx += 1;
+        }
+        if idx > start {
+            let mut selectors: Vec<RowSelector> = Vec::new();
+            let mut cursor = 0u64;
+            for &ordinal in &ordinals[start..idx] {
+                let row = ordinal - offset;
+                if row > cursor {
+                    selectors.push(RowSelector::skip((row - cursor) as usize));
+                }
+                match selectors.last_mut() {
+                    Some(last) if !last.skip => last.row_count += 1,
+                    _ => selectors.push(RowSelector::select(1)),
+                }
+                cursor = row + 1;
+            }
+            if cursor < rg_rows {
+                selectors.push(RowSelector::skip((rg_rows - cursor) as usize));
+            }
+            // `scan_selection` is a no-op on `Skip` row groups, so set the access directly.
+            plan.set(rg_idx, RowGroupAccess::Selection(selectors.into()));
+        }
+        offset = rg_end;
+    }
+    Some(plan)
 }
 
 /// Load deletion-vector keep masks for the selected files.
@@ -402,6 +514,7 @@ async fn get_data_scan_plan(
     scan_plan: KernelScanPlan,
     replayed: ReplayedScanFiles,
     limit: Option<usize>,
+    row_ordinal_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ReplayedScanFiles {
         files,
@@ -464,11 +577,16 @@ async fn get_data_scan_plan(
 
     // Group the files by their object store url. Since datafusion assumes that all files in a
     // DataSourceExec are stored in the same object store, we need to create one plan per store
-    let partitioned_files = files
+    let mut partitioned_files = files
         .into_iter()
         .enumerate()
         .map(to_partitioned_file)
         .try_collect::<_, Vec<_>, _>()?;
+    // Deletion-vector keep-masks are consumed POSITIONALLY against the rows the reader
+    // emits; a row-skipping access plan would desynchronize them, so never combine the two.
+    if let Some(selections) = row_ordinal_selections.filter(|s| !s.is_empty() && !has_deletion_vectors) {
+        attach_row_ordinal_access_plans(session, &mut partitioned_files, selections).await?;
+    }
 
     let files_by_store = partitioned_files
         .into_iter()
@@ -487,7 +605,7 @@ async fn get_data_scan_plan(
     // reappears). Drop the predicate when this scan carries any DV keep-mask; the
     // common DV-free scans (e.g. the freshly compacted hot tail) still push down.
     let table_config = scan_plan.table_configuration();
-    let predicate = if table_config.is_feature_enabled(&TableFeature::RowTracking) || !dvs.is_empty() {
+    let predicate = if table_config.is_feature_enabled(&TableFeature::RowTracking) || has_deletion_vectors {
         None
     } else {
         scan_plan.parquet_predicate.as_ref()
@@ -945,6 +1063,32 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), MAX_PARTITION_DICT_CARDINALITY);
         assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn test_access_plan_for_ordinals() {
+        use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
+        use parquet::arrow::arrow_reader::RowSelector;
+        // Row groups of 3 and 4 rows; unsorted ordinals {1, 5, 6}.
+        let plan = access_plan_for_ordinals(&[3, 4], &[5, 1, 6]).unwrap();
+        assert_eq!(
+            plan.inner(),
+            &[
+                RowGroupAccess::Selection(vec![RowSelector::skip(1), RowSelector::select(1), RowSelector::skip(1)].into()),
+                RowGroupAccess::Selection(vec![RowSelector::skip(2), RowSelector::select(2)].into()),
+            ]
+        );
+        assert_eq!(access_plan_for_ordinals(&[3, 4], &[0]).unwrap().inner()[1], RowGroupAccess::Skip);
+        assert!(access_plan_for_ordinals(&[3, 4], &[7]).is_none(), "out of range falls back to a full read");
+        assert_eq!(access_plan_for_ordinals(&[3, 4], &[]).unwrap().inner(), &[RowGroupAccess::Skip, RowGroupAccess::Skip]);
+    }
+
+    #[test]
+    fn test_path_matches_table_relative() {
+        assert!(path_matches_table_relative("timefusion/default/t/project_id=x/part-0.parquet", "project_id=x/part-0.parquet"));
+        assert!(path_matches_table_relative("project_id=x/part-0.parquet", "project_id=x/part-0.parquet"));
+        assert!(!path_matches_table_relative("t/other_project_id=x/part-0.parquet", "project_id=x/part-0.parquet"));
+        assert!(!path_matches_table_relative("t/part-0.parquet", ""));
     }
 
     #[tokio::test]
