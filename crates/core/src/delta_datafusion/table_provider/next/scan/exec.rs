@@ -484,10 +484,17 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
-    // TODO: setting this will fail certain tests, but why
-    // fn maintains_input_order(&self) -> Vec<bool> {
-    //     vec![true]
-    // }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Projection, transforms, and deletion masks preserve the relative order of rows,
+        // so an ordered merge (not an unordered coalesce) keeps the Parquet scan's ordering.
+        vec![true]
+    }
+
+    fn supports_sort_pushdown(&self) -> bool {
+        // Physical masks and row ordinals depend on the reader's row sequence: keeping an
+        // existing ordering is safe, inserting a new sort below this boundary is not.
+        false
+    }
 
     fn replace_children(
         self: Arc<Self>,
