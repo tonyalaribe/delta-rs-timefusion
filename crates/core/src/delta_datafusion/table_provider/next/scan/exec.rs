@@ -22,7 +22,7 @@ use datafusion::common::{
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::collect_columns;
-use datafusion::physical_expr::{Distribution, EquivalenceProperties};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -30,7 +30,7 @@ use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
     InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, Statistics,
-    coalesce_partitions::CoalescePartitionsExec, union::UnionExec,
+    coalesce_partitions::CoalescePartitionsExec, sorts::sort_preserving_merge::SortPreservingMergeExec, union::UnionExec,
 };
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
@@ -158,12 +158,44 @@ impl DisplayAs for DeltaScanExec {
     }
 }
 
+/// Re-express a column-only `LexOrdering` over `schema`, resolving each sort column by name.
+/// Keeps the longest satisfiable prefix: stops at the first sort expr that is not a plain column
+/// or whose column is absent from `schema` (e.g. pruned by projection). Returns `None` if not
+/// even the leading column survives.
+fn remap_ordering_to_schema(ordering: &LexOrdering, schema: &SchemaRef) -> Option<LexOrdering> {
+    let mut exprs = Vec::with_capacity(ordering.len());
+    for sort in ordering.iter() {
+        let Some(col) = sort.expr.downcast_ref::<Column>() else {
+            break;
+        };
+        let Some((index, _)) = schema.column_with_name(col.name()) else {
+            break;
+        };
+        exprs.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(col.name(), index)),
+            sort.options,
+        ));
+    }
+    LexOrdering::new(exprs)
+}
+
 fn plan_properties(
     scan_plan: &KernelScanPlan,
     input: &Arc<dyn ExecutionPlan>,
 ) -> Arc<PlanProperties> {
+    // Propagate the parquet scan's footer-derived ordering onto the post-transform output
+    // schema: the kernel transform only projects/casts/appends the file id, so order survives.
+    let output_schema = &scan_plan.contract.output_schema;
+    let eq_properties = match input
+        .properties()
+        .output_ordering()
+        .and_then(|ordering| remap_ordering_to_schema(ordering, output_schema))
+    {
+        Some(ordering) => EquivalenceProperties::new_with_orderings(Arc::clone(output_schema), [ordering]),
+        None => EquivalenceProperties::new(Arc::clone(output_schema)),
+    };
     Arc::new(PlanProperties::new(
-        EquivalenceProperties::new(Arc::clone(&scan_plan.contract.output_schema)),
+        eq_properties,
         input.properties().partitioning.clone(),
         input.properties().emission_type,
         input.properties().boundedness,
@@ -243,6 +275,11 @@ impl DeltaScanExec {
             }
             if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
                 return visit(coalesce.input(), expected, observed);
+            }
+            // Like coalescing, an ordered merge interleaves partitions but keeps each input's
+            // row order, so per-file positional masks stay aligned (fetch is rejected above).
+            if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
+                return visit(merge.input(), expected, observed);
             }
             if let Some(union) = plan.downcast_ref::<UnionExec>() {
                 for input in union.inputs() {
