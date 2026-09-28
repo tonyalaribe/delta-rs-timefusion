@@ -32,7 +32,6 @@ use datafusion::physical_plan::{
     InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, Statistics,
     coalesce_partitions::CoalescePartitionsExec, sorts::sort_preserving_merge::SortPreservingMergeExec, union::UnionExec,
 };
-use datafusion::scalar::ScalarValue;
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use delta_kernel::schema::DataType as KernelDataType;
@@ -253,19 +252,10 @@ impl DeltaScanExec {
     }
 
     fn validate_dv_child_topology(&self, input: &Arc<dyn ExecutionPlan>) -> Result<()> {
-        fn scalar_file_id(value: &ScalarValue) -> Option<&str> {
-            match value {
-                ScalarValue::Dictionary(_, value) => scalar_file_id(value),
-                ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
-                    Some(value.as_str())
-                }
-                _ => None,
-            }
-        }
-
         fn visit(
             plan: &Arc<dyn ExecutionPlan>,
             expected: &super::PhysicalFileIdentityMap,
+            masks: &HashMap<String, Vec<bool>>,
             observed: &mut HashSet<String>,
         ) -> Result<()> {
             if let Some(fetch) = plan.fetch() {
@@ -274,16 +264,16 @@ impl DeltaScanExec {
                 );
             }
             if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
-                return visit(coalesce.input(), expected, observed);
+                return visit(coalesce.input(), expected, masks, observed);
             }
             // Like coalescing, an ordered merge interleaves partitions but keeps each input's
             // row order, so per-file positional masks stay aligned (fetch is rejected above).
             if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
-                return visit(merge.input(), expected, observed);
+                return visit(merge.input(), expected, masks, observed);
             }
             if let Some(union) = plan.downcast_ref::<UnionExec>() {
                 for input in union.inputs() {
-                    visit(input, expected, observed)?;
+                    visit(input, expected, masks, observed)?;
                 }
                 return Ok(());
             }
@@ -308,15 +298,23 @@ impl DeltaScanExec {
                     "DeltaScanExec requires a locked file group layout during sequential deletion vector scans"
                 );
             }
-            if config.file_source.filter().is_some() {
+            // A pushed filter skips rows, so it is only sound on files no keep-mask indexes.
+            if config.file_source.filter().is_some()
+                && config.file_groups.iter().flat_map(|g| g.iter()).any(|file| {
+                    file.partition_values
+                        .first()
+                        .and_then(|v| super::scalar_file_id(v))
+                        .is_none_or(|id| masks.contains_key(id))
+                })
+            {
                 return plan_err!(
-                    "DeltaScanExec rejects file source filters during sequential deletion vector scans"
+                    "DeltaScanExec rejects file source filters over deletion-vector-masked files"
                 );
             }
 
             for group in &config.file_groups {
                 for file in group.iter() {
-                    let Some(file_id) = file.partition_values.first().and_then(scalar_file_id)
+                    let Some(file_id) = file.partition_values.first().and_then(|v| super::scalar_file_id(v))
                     else {
                         return plan_err!(
                             "A sequential deletion vector file lacks a compact file id"
@@ -354,8 +352,13 @@ impl DeltaScanExec {
                 "DeltaScanExec deletion vector topology validation requires sequential state"
             )
         })?;
+        let masks = self.dv_state.selection_vectors().ok_or_else(|| {
+            internal_datafusion_err!(
+                "DeltaScanExec deletion vector validation requires sequential state"
+            )
+        })?;
         let mut observed = HashSet::new();
-        visit(input, expected, &mut observed)?;
+        visit(input, expected, masks, &mut observed)?;
         if observed.len() != expected.len() {
             return plan_err!("DeltaScanExec sequential deletion vector scan lacks selected files");
         }

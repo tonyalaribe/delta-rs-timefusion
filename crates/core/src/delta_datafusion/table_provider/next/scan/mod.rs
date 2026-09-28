@@ -925,6 +925,7 @@ async fn get_data_scan_plan(
         metrics,
     } = replayed;
     let has_deletion_vectors = !dvs.is_empty();
+    let masked_file_ids: HashSet<String> = dvs.keys().cloned().collect();
     let mut partition_stats = HashMap::new();
 
     let dv_state = if has_deletion_vectors {
@@ -989,39 +990,67 @@ async fn get_data_scan_plan(
         attach_row_ordinal_access_plans(session, &mut partitioned_files, selections).await?;
     }
 
-    let files_by_store = partitioned_files
-        .into_iter()
-        .into_group_map()
-        .into_iter()
-        .map(|(store, files)| (store, files, has_deletion_vectors));
-
-    // TODO(roeap); not sure exactly how row tracking is implemented in kernel right now
-    // so leaving predicate as None for now until we are sure this is safe to do.
-    //
     // Deletion vectors are applied as per-file keep-masks indexed by ROW POSITION
-    // (`exec::consume_dv_mask`). Even when a read scan opts in to pushdown under DV
-    // (pushdown_with_deletion_vectors), a file that actually carries a keep-mask
-    // must NOT get the predicate pushed: pushdown filters rows before the mask is
-    // applied, shifting positions so the mask hides the wrong rows (a deleted row
-    // reappears). Drop the predicate when this scan carries any DV keep-mask; the
-    // common DV-free scans (e.g. the freshly compacted hot tail) still push down.
+    // (`exec::consume_dv_mask`), so a file that carries a keep-mask must NOT get the
+    // predicate pushed: pushdown filters rows before the mask is applied, shifting
+    // positions so the mask hides the wrong rows (a deleted row reappears). Only the
+    // MASKED files lose it: withholding it scan-wide made one masked file strip the
+    // predicate (time bound included) from every sibling in the window. Retained row
+    // indexes count physical rows too, so they keep the whole scan unpushed.
+    // Row tracking: not sure exactly how kernel implements it yet, so never push.
     let table_config = scan_plan.table_configuration();
-    let predicate = if table_config.is_feature_enabled(&TableFeature::RowTracking) || has_deletion_vectors {
-        None
-    } else {
-        scan_plan.parquet_predicate.as_ref()
-    };
+    let predicate = (!table_config.is_feature_enabled(&TableFeature::RowTracking))
+        .then_some(scan_plan.parquet_predicate.as_ref())
+        .flatten();
+    let retains_row_index = scan_plan.contract.retained_row_index_field().is_some();
+    let (masked, unmasked): (Vec<_>, Vec<_>) = partitioned_files.into_iter().partition(|(_, f)| {
+        has_deletion_vectors
+            && (retains_row_index
+                || f.partition_values
+                    .first()
+                    .and_then(scalar_file_id)
+                    .is_some_and(|id| masked_file_ids.contains(id)))
+    });
     let file_id_field = scan_plan.contract.file_id_field.clone();
-    let pq_plan = get_read_plan(
-        session,
-        files_by_store,
-        &scan_plan.parquet_read_schema,
-        &scan_plan.parquet_predicate_schema,
-        limit,
-        &file_id_field,
-        predicate,
-    )
-    .await?;
+    let mut pq_plans = Vec::new();
+    for (files, predicate) in [(masked, None), (unmasked, predicate)] {
+        if files.is_empty() {
+            continue;
+        }
+        let files_by_store = files
+            .into_iter()
+            .into_group_map()
+            .into_iter()
+            .map(|(store, files)| (store, files, has_deletion_vectors));
+        pq_plans.push(
+            get_read_plan(
+                session,
+                files_by_store,
+                &scan_plan.parquet_read_schema,
+                &scan_plan.parquet_predicate_schema,
+                limit,
+                &file_id_field,
+                predicate,
+            )
+            .await?,
+        );
+    }
+    let pq_plan = match pq_plans.len() {
+        0 => {
+            get_read_plan(
+                session,
+                std::iter::empty(),
+                &scan_plan.parquet_read_schema,
+                &scan_plan.parquet_predicate_schema,
+                limit,
+                &file_id_field,
+                None,
+            )
+            .await?
+        }
+        1 => pq_plans.remove(0),
+        _ => UnionExec::try_new(pq_plans)?,
+    };
 
     let transforms = Arc::new(transforms);
     let public_file_ids = Arc::new(public_file_ids);
@@ -1075,6 +1104,17 @@ fn update_partition_stats(
 }
 
 type FilesByStore = (ObjectStoreUrl, Vec<PartitionedFile>, bool);
+
+/// The compact scan file id carried as a file's first partition value.
+pub(super) fn scalar_file_id(value: &ScalarValue) -> Option<&str> {
+    match value {
+        ScalarValue::Dictionary(_, value) => scalar_file_id(value),
+        ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
+            Some(value.as_str())
+        }
+        _ => None,
+    }
+}
 
 fn compact_internal_file_id(file_index: usize) -> String {
     file_index.to_string()
@@ -1257,7 +1297,8 @@ async fn get_read_plan(
         // TODO(roeap); we might be able to also push selection vectors into the read plan
         // by creating parquet access plans. However we need to make sure this does not
         // interfere with other delta features like row ids.
-        if !has_deletion_vectors && let Some(pred) = predicate {
+        // Callers withhold `predicate` from DV-masked files (see `get_data_scan_plan`).
+        if let Some(pred) = predicate {
             // One non-convertible conjunct (e.g. a UDF like `text_match`) must not discard the
             // whole parquet predicate: bind each top-level AND term independently and push the
             // survivors. Pushdown is Inexact, so dropping a term only loses an optimization.
