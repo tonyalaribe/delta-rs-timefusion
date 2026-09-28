@@ -251,6 +251,13 @@ impl DeltaScanExec {
         self.dv_state.is_sequential()
     }
 
+    /// Whether rows below this node are consumed by physical position (deletion-vector masks,
+    /// retained row indexes): its input must reach it file by file in reader order, so
+    /// nothing may be sorted, split or repartitioned beneath it.
+    pub fn consumes_row_positions(&self) -> bool {
+        self.has_deletion_vectors() || self.scan_plan.contract.retained_row_index_field().is_some()
+    }
+
     fn validate_dv_child_topology(&self, input: &Arc<dyn ExecutionPlan>) -> Result<()> {
         fn visit(
             plan: &Arc<dyn ExecutionPlan>,
