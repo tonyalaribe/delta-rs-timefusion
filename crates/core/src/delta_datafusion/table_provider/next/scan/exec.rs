@@ -477,15 +477,19 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn input_distribution_requirements(&self) -> InputDistributionRequirements {
-        if self.scan_plan.contract.retained_row_index_field().is_some()
-            || self.has_deletion_vectors()
-        {
-            // DeltaScanExec requires one stream to preserve physical row order for retained row
-            // indexes and sequential DV masks.
+        if self.scan_plan.contract.retained_row_index_field().is_some() {
+            // Retained row indexes need one stream to preserve physical row order.
             InputDistributionRequirements::new(vec![Distribution::SinglePartition])
         } else {
+            // DV masks are positional per file, not per stream: the topology validator keeps
+            // every file whole in exactly one partition, so each partition masks its own files.
             InputDistributionRequirements::new(vec![Distribution::UnspecifiedDistribution])
         }
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // A round-robin repartition below would split files across streams.
+        vec![!self.has_deletion_vectors()]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -558,18 +562,11 @@ impl ExecutionPlan for DeltaScanExec {
     ) -> Result<SendableRecordBatchStream> {
         // Normal planning enforces this through EnforceDistribution. Keep this check for
         // callers that build DeltaScanExec directly or replace its child plan.
-        let retains_row_index = self.scan_plan.contract.retained_row_index_field().is_some();
-        let has_deletion_vectors = self.has_deletion_vectors();
-        if retains_row_index || has_deletion_vectors {
+        if self.scan_plan.contract.retained_row_index_field().is_some() {
             let input_partition_count = self.input.properties().partitioning.partition_count();
             if input_partition_count > 1 {
-                if retains_row_index {
-                    return plan_err!(
-                        "DeltaScanExec retained row indexes require a single input partition, got {input_partition_count}"
-                    );
-                }
                 return plan_err!(
-                    "DeltaScanExec sequential deletion vectors require a single input partition, got {input_partition_count}"
+                    "DeltaScanExec retained row indexes require a single input partition, got {input_partition_count}"
                 );
             }
         }
@@ -2039,7 +2036,9 @@ mod tests {
     async fn test_optimized_multi_group_dv_scan_is_concurrently_repeatable() -> TestResult {
         let table = open_fs_path(DV_TABLE_PATH);
         let provider = table.table_provider().await?;
-        let config = SessionConfig::new().with_target_partitions(2);
+        // More target partitions than file groups, and a batch size the fixture's rows exceed so
+        // a round-robin repartition looks beneficial: nothing may split a masked file to fill them.
+        let config = SessionConfig::new().with_target_partitions(4).with_batch_size(1);
         let session = Arc::new(datafusion::prelude::SessionContext::new_with_config(config));
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
@@ -2130,13 +2129,14 @@ mod tests {
         let optimized_scan = optimized
             .downcast_ref::<DeltaScanExec>()
             .expect("optimizer must retain DeltaScanExec");
+        // Each file group masks its own whole files, so the scan keeps one stream per group
+        // instead of funnelling every group through a single merged stream.
         assert!(
-            optimized_scan
-                .input
-                .downcast_ref::<CoalescePartitionsExec>()
-                .is_some(),
-            "fixture must exercise multiple file groups under one coalescing node"
+            optimized_scan.input.downcast_ref::<DataSourceExec>().is_some(),
+            "a DV scan must read its file groups in parallel:\n{}",
+            datafusion::physical_plan::displayable(optimized.as_ref()).indent(true)
         );
+        assert_eq!(optimized.properties().partitioning.partition_count(), 2);
 
         let (first, second) = tokio::join!(
             collect(Arc::clone(&optimized), session.task_ctx()),
