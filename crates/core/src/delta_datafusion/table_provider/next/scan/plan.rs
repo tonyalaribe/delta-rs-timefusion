@@ -274,12 +274,15 @@ impl KernelScanPlan {
 
         // At this point we should only have supported predicates, but we decide where
         // when can handle them (kernel scan and/or parquet scan)
-        let (kernel_predicate, parquet_predicate) = process_filters(filters, table_config, config)?;
+        // A dedicated skipping predicate replaces the filters' kernel terms, so converting them
+        // would be wasted work — and for a large `IN` list it is the dominant planning cost.
+        let (kernel_predicate, parquet_predicate) =
+            process_filters(filters, table_config, config, skipping_predicate.is_none())?;
 
         // if some dedicated file skipping predicate is supplied,
         // we do not push the scan filters into the kernel scan.
         let scan_predicate = if let Some(sp) = skipping_predicate {
-            let (scan_predicate, _) = process_filters(&sp, table_config, config)?;
+            let (scan_predicate, _) = process_filters(&sp, table_config, config, true)?;
             if scan_predicate.is_none() {
                 debug!(
                     predicate = ?sp,
@@ -501,6 +504,7 @@ pub(crate) fn supports_filters_pushdown(
                 scan_config,
                 file_id_field,
                 parquet_pushdown_enabled,
+                true,
             )
             .pushdown
         })
@@ -520,6 +524,7 @@ fn process_filters(
     filters: &[Expr],
     config: &TableConfiguration,
     scan_config: &DeltaScanConfig,
+    with_kernel: bool,
 ) -> Result<(Option<PredicateRef>, Option<Expr>)> {
     let file_id_field = scan_config
         .file_column_name
@@ -538,6 +543,7 @@ fn process_filters(
                 scan_config,
                 file_id_field,
                 parquet_pushdown_enabled,
+                with_kernel,
             )
         })
         .map(|p| (p.parquet_predicate, p.kernel_predicate))
@@ -569,6 +575,7 @@ fn process_predicate<'a>(
     scan_config: &DeltaScanConfig,
     file_id_column: &str,
     parquet_pushdown_enabled: bool,
+    with_kernel: bool,
 ) -> ProcessedPredicate<'a> {
     let cols = config.metadata().partition_columns();
     let only_partition_refs = expr.column_refs().iter().all(|c| cols.contains(&c.name));
@@ -591,7 +598,7 @@ fn process_predicate<'a>(
     let _has_partition_data = config.is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
     // Try to convert the expression into a kernel predicate
-    if let Ok(kernel_predicate) = to_delta_predicate(expr) {
+    if with_kernel && let Ok(kernel_predicate) = to_delta_predicate(expr) {
         let logical_schema = config.logical_schema();
         match resolve_predicate(&logical_schema, &kernel_predicate) {
             ColumnResolution::Skippable | ColumnResolution::Unknown => {

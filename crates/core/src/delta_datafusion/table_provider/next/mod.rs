@@ -549,7 +549,11 @@ impl DeltaScan {
         })
     }
 
-    pub(crate) fn with_file_skipping_predicate(
+    /// Replace the predicate delta-kernel uses to skip files during log replay. The scan's
+    /// own filters still drive the parquet predicate, so a read can withhold a conjunct that
+    /// cannot skip files (e.g. a large id `IN` list over an explicit file selection) without
+    /// losing its row-level pruning.
+    pub fn with_file_skipping_predicate(
         mut self,
         predicate: impl IntoIterator<Item = Expr>,
     ) -> Self {
