@@ -76,7 +76,7 @@ use self::exec_meta::DeltaScanMetaExec;
 use self::expr_adapter::{DeltaPhysicalExprAdapterFactory, relax_schema_nested_nullability};
 pub(crate) use self::plan::{KernelScanPlan, ProjectedScanContract, supports_filters_pushdown};
 use self::replay::{ScanFileContext, ScanFileStream};
-use super::{FileSelection, ResolvedFileSelection};
+use super::{FileSelection, MissingSelectedFilePolicy, ResolvedFileSelection};
 use crate::{
     DeltaTableError,
     delta_datafusion::{
@@ -745,17 +745,22 @@ pub(super) async fn replay_deletion_vectors(
 pub(super) async fn resolve_file_selection(
     selection: &FileSelection,
     scan_plan: &KernelScanPlan,
-    stream: ScanMetadataStream,
+    stream: impl FnOnce() -> ScanMetadataStream,
 ) -> Result<ResolvedFileSelection> {
     let requested_file_ids =
         resolve_input_file_ids_on_blocking_pool(selection, scan_plan.scan.table_root()).await?;
-    if requested_file_ids.is_empty() {
+    // The scan's own replay applies the requested ids and an inactive one matches no file;
+    // only `Error` must know which are missing, which costs a second full replay.
+    if requested_file_ids.is_empty()
+        || selection.missing_file_policy != MissingSelectedFilePolicy::Error
+    {
         return Ok(ResolvedFileSelection::new(
-            HashSet::new(),
+            requested_file_ids,
             Vec::new(),
             selection.missing_file_policy,
         ));
     }
+    let stream = stream();
 
     let mut missing_file_ids = requested_file_ids;
     let selected_active_file_ids = collect_selected_active_file_ids(
@@ -2042,13 +2047,32 @@ mod tests {
         let resolved = resolve_file_selection(
             &FileSelection::from_file_paths(Vec::<String>::new()),
             &scan_plan,
-            stream,
+            || stream,
         )
         .await?;
 
         assert!(resolved.active_file_ids.is_empty());
         assert!(resolved.missing_file_ids.is_empty());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ignore_selection_skips_the_second_replay() -> TestResult {
+        let log_store = TestTables::Simple.table_builder()?.build_storage()?;
+        let snapshot = Snapshot::try_new(&log_store, None).await?;
+        let scan_plan =
+            KernelScanPlan::try_new(&snapshot, None, &[], &DeltaScanConfig::default(), None)?;
+        let selection = FileSelection::from_file_paths(["part-00000-a.parquet"])
+            .with_missing_file_policy(MissingSelectedFilePolicy::Ignore);
+
+        let resolved = resolve_file_selection(&selection, &scan_plan, || -> ScanMetadataStream {
+            panic!("an Ignore selection must not replay the snapshot to resolve itself")
+        })
+        .await?;
+
+        assert_eq!(resolved.active_file_ids.len(), 1);
+        assert!(resolved.missing_file_ids.is_empty());
         Ok(())
     }
 

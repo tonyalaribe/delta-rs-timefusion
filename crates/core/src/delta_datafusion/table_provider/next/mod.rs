@@ -716,7 +716,7 @@ impl DeltaScan {
 
         let scan_plan =
             KernelScanPlan::try_new(self.snapshot.snapshot(), None, &[], &self.config, None)?;
-        let stream = self.scan_metadata_stream(&scan_plan, engine);
+        let stream = || self.scan_metadata_stream(&scan_plan, engine);
 
         scan::resolve_file_selection(selection, &scan_plan, stream)
             .await
