@@ -163,6 +163,14 @@ impl InstrumentedParquetFileReader {
 /// Per-reader budget for column chunks fetched ahead of the row group that asked.
 const READ_AHEAD_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Read-ahead is off until the embedding application turns it on (a runtime flag, so it
+/// can be measured on and off within one process).
+static READ_AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_read_ahead(on: bool) {
+    READ_AHEAD.store(on, Relaxed);
+}
+
 /// Column-chunk read-ahead. The parquet reader fetches one row group's column chunks
 /// per `get_byte_ranges` call, one call after another, so a file of N row groups costs
 /// N sequential object-store round trips per column set (~0.5 s each on prod's store).
@@ -291,7 +299,7 @@ impl AsyncFileReader for InstrumentedParquetFileReader {
             if misses.is_empty() {
                 return Ok(served.into_iter().flatten().collect());
             }
-            let ahead = self.ahead.plan(&misses);
+            let ahead = if READ_AHEAD.load(Relaxed) { self.ahead.plan(&misses) } else { Vec::new() };
             let mut fetched = self
                 .inner
                 .get_byte_ranges(misses.iter().chain(&ahead).cloned().collect())
@@ -458,6 +466,7 @@ mod read_ahead_tests {
     /// rides ahead into the next row groups.
     #[tokio::test]
     async fn read_ahead_returns_the_same_rows_in_fewer_round_trips() {
+        set_read_ahead(true);
         let (plain_calls, ahead_calls) =
             (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let plain = read(Counting(file(), Arc::clone(&plain_calls))).await;
