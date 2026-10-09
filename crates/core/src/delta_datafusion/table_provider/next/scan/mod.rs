@@ -14,6 +14,7 @@
 //! The scan planning process in [`plan`] determines which files to read and how to apply
 //! predicates, while execution plans handle the actual data reading and transformation.
 
+use crate::delta_datafusion::parquet_metrics::{PlanPhase, record_plan_phase};
 use std::{
     collections::{HashSet, VecDeque},
     pin::Pin,
@@ -46,6 +47,11 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use datafusion::{
+    common::ScalarValue, datasource::physical_plan::parquet::metadata::DFParquetMetadata,
+    execution::cache::cache_manager::FileMetadataCache, physical_expr::LexOrdering,
+};
+use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::{
     PartitionedFile, TableSchema, compute_all_files_statistics, file_groups::FileGroup,
     file_scan_config::FileScanConfigBuilder, source::DataSourceExec,
@@ -59,15 +65,8 @@ use delta_kernel::{
 };
 use futures::{Stream, StreamExt as _, TryStreamExt as _, future::ready};
 use itertools::Itertools as _;
-use object_store::{ObjectMeta, path::Path};
-use datafusion::{
-    common::ScalarValue,
-    datasource::physical_plan::parquet::metadata::DFParquetMetadata,
-    execution::cache::cache_manager::FileMetadataCache,
-    physical_expr::LexOrdering,
-};
-use datafusion_datasource::file_scan_config::FileScanConfig;
 use object_store::ObjectStore;
+use object_store::{ObjectMeta, path::Path};
 use tracing::debug;
 use url::Url;
 
@@ -131,7 +130,9 @@ pub(super) async fn execution_plan(
         )));
     }
 
+    let started = std::time::Instant::now();
     let replayed = replay_files(engine, &scan_plan, config.clone(), stream, file_selection).await?;
+    record_plan_phase(PlanPhase::Replay, started);
 
     let file_id_field = scan_plan.contract.file_id_field.clone();
     if scan_plan.is_metadata_only() && !scan_plan.contract.retain_row_index {
@@ -178,7 +179,11 @@ pub(super) async fn execution_plan(
         }
     }
 
-    get_data_scan_plan(session, scan_plan, replayed, limit, row_ordinal_selections).await
+    let started = std::time::Instant::now();
+    let plan =
+        get_data_scan_plan(session, scan_plan, replayed, limit, row_ordinal_selections).await;
+    record_plan_phase(PlanPhase::Build, started);
+    plan
 }
 
 /// Per-file sort-column footer stats: `(column index, (min, max, null_count))` for every
@@ -190,10 +195,7 @@ type FooterSortStats = Option<Vec<(usize, (ScalarValue, ScalarValue, usize))>>;
 fn split_by_declared_ordering(
     files: Vec<PartitionedFile>,
     conforms: &[bool],
-) -> (
-    Vec<PartitionedFile>,
-    Vec<PartitionedFile>,
-) {
+) -> (Vec<PartitionedFile>, Vec<PartitionedFile>) {
     let (conforming, rest): (Vec<_>, Vec<_>) = files
         .into_iter()
         .enumerate()
@@ -506,10 +508,7 @@ fn apply_footer_sort_stats(
 /// Longest prefix of `ordering` for which **every** file carries min/max stats on a plain
 /// column — the largest claim DataFusion's stats-based validation can actually confirm.
 /// Zero means not even the lead column is stats-backed everywhere.
-fn stats_backed_prefix_len(
-    files: &[PartitionedFile],
-    ordering: &LexOrdering,
-) -> usize {
+fn stats_backed_prefix_len(files: &[PartitionedFile], ordering: &LexOrdering) -> usize {
     use datafusion::physical_expr::expressions::Column;
     ordering
         .iter()
@@ -573,7 +572,6 @@ fn scalar_extreme(array: &ArrayRef, keep: std::cmp::Ordering) -> Option<ScalarVa
     })?
 }
 
-
 /// Attach a [`ParquetAccessPlan`] selecting exactly the requested row ordinals to each
 /// matching file. Footer fetch failures and out-of-range ordinals leave the file read in full.
 async fn attach_row_ordinal_access_plans(
@@ -583,7 +581,10 @@ async fn attach_row_ordinal_access_plans(
 ) -> Result<()> {
     use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
     const FOOTER_FETCH_CONCURRENCY: usize = 16;
-    let cache = session.runtime_env().cache_manager.get_file_metadata_cache();
+    let cache = session
+        .runtime_env()
+        .cache_manager
+        .get_file_metadata_cache();
     let matched = files
         .iter()
         .enumerate()
@@ -609,17 +610,21 @@ async fn attach_row_ordinal_access_plans(
         .map(|(idx, store, meta, ordinals)| {
             let cache = cache.clone();
             async move {
-            let footer = DFParquetMetadata::new(store.as_ref(), &meta)
-                .with_file_metadata_cache(Some(cache))
-                .fetch_metadata()
-                .await
-                .ok()?;
-            let rg_rows: Vec<i64> = footer.row_groups().iter().map(|rg| rg.num_rows()).collect();
-            access_plan_for_ordinals(&rg_rows, &ordinals).map(|plan| (idx, plan))
+                let footer = DFParquetMetadata::new(store.as_ref(), &meta)
+                    .with_file_metadata_cache(Some(cache))
+                    .fetch_metadata()
+                    .await
+                    .ok()?;
+                let rg_rows: Vec<i64> =
+                    footer.row_groups().iter().map(|rg| rg.num_rows()).collect();
+                access_plan_for_ordinals(&rg_rows, &ordinals).map(|plan| (idx, plan))
             }
         })
         .collect();
-    let plans: Vec<_> = futures::stream::iter(fetches).buffer_unordered(FOOTER_FETCH_CONCURRENCY).collect().await;
+    let plans: Vec<_> = futures::stream::iter(fetches)
+        .buffer_unordered(FOOTER_FETCH_CONCURRENCY)
+        .collect()
+        .await;
     for (idx, plan) in plans.into_iter().flatten() {
         files[idx].1.extensions.insert(plan);
     }
@@ -631,7 +636,8 @@ async fn attach_row_ordinal_access_plans(
 fn path_matches_table_relative(location: &str, key: &str) -> bool {
     !key.is_empty()
         && location.ends_with(key)
-        && (location.len() == key.len() || location.as_bytes()[location.len() - key.len() - 1] == b'/')
+        && (location.len() == key.len()
+            || location.as_bytes()[location.len() - key.len() - 1] == b'/')
 }
 
 /// A [`ParquetAccessPlan`] selecting exactly the given global row ordinals, given per
@@ -648,7 +654,10 @@ fn access_plan_for_ordinals(
     let mut ordinals = ordinals.to_vec();
     ordinals.sort_unstable();
     ordinals.dedup();
-    if ordinals.last().is_some_and(|&ordinal| ordinal >= total_rows) {
+    if ordinals
+        .last()
+        .is_some_and(|&ordinal| ordinal >= total_rows)
+    {
         return None;
     }
     let mut plan = ParquetAccessPlan::new_none(rg_row_counts.len());
@@ -986,7 +995,9 @@ async fn get_data_scan_plan(
         .try_collect::<_, Vec<_>, _>()?;
     // Deletion-vector keep-masks are consumed POSITIONALLY against the rows the reader
     // emits; a row-skipping access plan would desynchronize them, so never combine the two.
-    if let Some(selections) = row_ordinal_selections.filter(|s| !s.is_empty() && !has_deletion_vectors) {
+    if let Some(selections) =
+        row_ordinal_selections.filter(|s| !s.is_empty() && !has_deletion_vectors)
+    {
         attach_row_ordinal_access_plans(session, &mut partitioned_files, selections).await?;
     }
 
@@ -1302,7 +1313,8 @@ async fn get_read_plan(
             // One non-convertible conjunct (e.g. a UDF like `text_match`) must not discard the
             // whole parquet predicate: bind each top-level AND term independently and push the
             // survivors. Pushdown is Inexact, so dropping a term only loses an optimization.
-            match adapter_factory.create(parquet_predicate_schema.clone(), full_read_schema.clone()) {
+            match adapter_factory.create(parquet_predicate_schema.clone(), full_read_schema.clone())
+            {
                 Ok(adapter) => {
                     let rewritten = datafusion::logical_expr::utils::split_conjunction(pred)
                         .into_iter()
@@ -1321,8 +1333,13 @@ async fn get_read_plan(
                             )) as _
                         });
                     match rewritten {
-                        Some(expr) => file_source = file_source.with_predicate(expr).with_pushdown_filters(true),
-                        None => debug!(predicate = ?pred, "Skipping parquet predicate pushdown: no conjunct could be bound"),
+                        Some(expr) => {
+                            file_source =
+                                file_source.with_predicate(expr).with_pushdown_filters(true)
+                        }
+                        None => {
+                            debug!(predicate = ?pred, "Skipping parquet predicate pushdown: no conjunct could be bound")
+                        }
                     }
                 }
                 Err(err) => debug!(
@@ -1339,9 +1356,18 @@ async fn get_read_plan(
         // unordered sibling leg instead of voiding the claim for the whole scan, and only the
         // longest sort prefix every conforming file has stats for is declared, so DataFusion's
         // per-group validation keeps it.
-        let derived_ordering =
-            derive_common_ordering(object_store.clone(), metadata_cache.clone(), &files, parquet_read_schema.clone()).await;
-        let footer_ordering = derived_ordering.as_ref().map(|(ordering, _, _)| ordering.clone());
+        let started = std::time::Instant::now();
+        let derived_ordering = derive_common_ordering(
+            object_store.clone(),
+            metadata_cache.clone(),
+            &files,
+            parquet_read_schema.clone(),
+        )
+        .await;
+        record_plan_phase(PlanPhase::FooterOrdering, started);
+        let footer_ordering = derived_ordering
+            .as_ref()
+            .map(|(ordering, _, _)| ordering.clone());
         let mut files = files;
         let (mut files, mut unordered_files, output_ordering, regroup) = match derived_ordering {
             Some((ordering, footer_stats, conforms)) => {
@@ -1363,21 +1389,30 @@ async fn get_read_plan(
         // Snapshot-order groups rarely validate under merge-on-read, so repack when a
         // stats-backed prefix is declared; otherwise keep the grouping as-is.
         let file_groups = match &output_ordering {
-            Some(ordering) if regroup => {
-                regroup_for_declared_ordering(file_groups, ordering, &full_table_schema, state.config().target_partitions())
-            }
+            Some(ordering) if regroup => regroup_for_declared_ordering(
+                file_groups,
+                ordering,
+                &full_table_schema,
+                state.config().target_partitions(),
+            ),
             _ => file_groups,
         };
-        let data_source = |file_groups: Vec<FileGroup>, ordering: Option<Vec<LexOrdering>>| -> Result<Arc<dyn ExecutionPlan>> {
-            let (file_groups, statistics) = compute_all_files_statistics(file_groups, full_table_schema.clone(), true, false)?;
+        let data_source = |file_groups: Vec<FileGroup>,
+                           ordering: Option<Vec<LexOrdering>>|
+         -> Result<Arc<dyn ExecutionPlan>> {
+            let (file_groups, statistics) =
+                compute_all_files_statistics(file_groups, full_table_schema.clone(), true, false)?;
             let file_group_count = file_groups.len();
-            let mut builder = FileScanConfigBuilder::new(store_url.clone(), Arc::new(file_source.clone()))
-                .with_file_groups(file_groups)
-                .with_statistics(statistics)
-                .with_limit(if has_deletion_vectors { None } else { limit })
-                .with_expr_adapter(Some(adapter_factory.clone() as _));
+            let mut builder =
+                FileScanConfigBuilder::new(store_url.clone(), Arc::new(file_source.clone()))
+                    .with_file_groups(file_groups)
+                    .with_statistics(statistics)
+                    .with_limit(if has_deletion_vectors { None } else { limit })
+                    .with_expr_adapter(Some(adapter_factory.clone() as _));
             if has_deletion_vectors {
-                builder = builder.with_output_partitioning(Some(Partitioning::UnknownPartitioning(file_group_count)));
+                builder = builder.with_output_partitioning(Some(
+                    Partitioning::UnknownPartitioning(file_group_count),
+                ));
             }
             if let Some(orderings) = ordering {
                 // Auto-enables `preserve_order`: groups merge with a SortPreservingMergeExec.
@@ -1393,7 +1428,10 @@ async fn get_read_plan(
         });
         plans.push(data_source(file_groups, orderings)?);
         if !unordered_files.is_empty() {
-            plans.push(data_source(partitioned_files_to_file_groups(unordered_files), None)?);
+            plans.push(data_source(
+                partitioned_files_to_file_groups(unordered_files),
+                None,
+            )?);
         }
     }
 
@@ -1947,20 +1985,47 @@ mod tests {
         assert_eq!(
             plan.inner(),
             &[
-                RowGroupAccess::Selection(vec![RowSelector::skip(1), RowSelector::select(1), RowSelector::skip(1)].into()),
-                RowGroupAccess::Selection(vec![RowSelector::skip(2), RowSelector::select(2)].into()),
+                RowGroupAccess::Selection(
+                    vec![
+                        RowSelector::skip(1),
+                        RowSelector::select(1),
+                        RowSelector::skip(1)
+                    ]
+                    .into()
+                ),
+                RowGroupAccess::Selection(
+                    vec![RowSelector::skip(2), RowSelector::select(2)].into()
+                ),
             ]
         );
-        assert_eq!(access_plan_for_ordinals(&[3, 4], &[0]).unwrap().inner()[1], RowGroupAccess::Skip);
-        assert!(access_plan_for_ordinals(&[3, 4], &[7]).is_none(), "out of range falls back to a full read");
-        assert_eq!(access_plan_for_ordinals(&[3, 4], &[]).unwrap().inner(), &[RowGroupAccess::Skip, RowGroupAccess::Skip]);
+        assert_eq!(
+            access_plan_for_ordinals(&[3, 4], &[0]).unwrap().inner()[1],
+            RowGroupAccess::Skip
+        );
+        assert!(
+            access_plan_for_ordinals(&[3, 4], &[7]).is_none(),
+            "out of range falls back to a full read"
+        );
+        assert_eq!(
+            access_plan_for_ordinals(&[3, 4], &[]).unwrap().inner(),
+            &[RowGroupAccess::Skip, RowGroupAccess::Skip]
+        );
     }
 
     #[test]
     fn test_path_matches_table_relative() {
-        assert!(path_matches_table_relative("timefusion/default/t/project_id=x/part-0.parquet", "project_id=x/part-0.parquet"));
-        assert!(path_matches_table_relative("project_id=x/part-0.parquet", "project_id=x/part-0.parquet"));
-        assert!(!path_matches_table_relative("t/other_project_id=x/part-0.parquet", "project_id=x/part-0.parquet"));
+        assert!(path_matches_table_relative(
+            "timefusion/default/t/project_id=x/part-0.parquet",
+            "project_id=x/part-0.parquet"
+        ));
+        assert!(path_matches_table_relative(
+            "project_id=x/part-0.parquet",
+            "project_id=x/part-0.parquet"
+        ));
+        assert!(!path_matches_table_relative(
+            "t/other_project_id=x/part-0.parquet",
+            "project_id=x/part-0.parquet"
+        ));
         assert!(!path_matches_table_relative("t/part-0.parquet", ""));
     }
 

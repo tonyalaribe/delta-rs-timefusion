@@ -566,7 +566,8 @@ async fn execute(
 
     if deletion_vectors {
         let (actions, num_deleted) =
-            deletion_vector_delete(session, &eager_snapshot, log_store.clone(), &files_scan).await?;
+            deletion_vector_delete(session, &eager_snapshot, log_store.clone(), &files_scan)
+                .await?;
         // Each changed file contributes one Remove + one Add (same path, new DV).
         metrics.num_removed_files = actions.len() / 2;
         metrics.num_added_files = actions.len() / 2;

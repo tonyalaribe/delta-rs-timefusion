@@ -526,7 +526,7 @@ mod tests {
                 target_alias: "target".to_string(),
                 source_alias: "source".to_string(),
                 writer_properties: None,
-            append_sort_by: vec![],
+                append_sort_by: vec![],
                 tolerate_concurrent_appends: false,
             },
         )

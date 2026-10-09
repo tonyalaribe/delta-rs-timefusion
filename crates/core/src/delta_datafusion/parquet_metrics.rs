@@ -37,6 +37,36 @@ pub struct ParquetScanMetrics {
     pub files_planned: u64,
     pub bytes_planned: u64,
     pub selected_row_groups: u64,
+    /// Microseconds `DeltaScan::scan` spent per planning phase, see [`PlanPhase`].
+    pub plan_phase_us: [u64; PlanPhase::COUNT],
+}
+
+/// Where `DeltaScan::scan` spends its planning time.
+#[derive(Debug, Clone, Copy)]
+pub enum PlanPhase {
+    KernelPlan,
+    FileSelection,
+    Replay,
+    FooterOrdering,
+    Build,
+}
+
+impl PlanPhase {
+    pub const COUNT: usize = 5;
+    pub const NAMES: [&str; Self::COUNT] = [
+        "kernel_plan",
+        "file_selection",
+        "replay",
+        "footer_ordering",
+        "build",
+    ];
+}
+
+static PLAN_PHASE_US: [AtomicU64; PlanPhase::COUNT] =
+    [const { AtomicU64::new(0) }; PlanPhase::COUNT];
+
+pub(crate) fn record_plan_phase(phase: PlanPhase, started: Instant) {
+    PLAN_PHASE_US[phase as usize].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
 }
 
 static METADATA_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -299,7 +329,11 @@ impl AsyncFileReader for InstrumentedParquetFileReader {
             if misses.is_empty() {
                 return Ok(served.into_iter().flatten().collect());
             }
-            let ahead = if READ_AHEAD.load(Relaxed) { self.ahead.plan(&misses) } else { Vec::new() };
+            let ahead = if READ_AHEAD.load(Relaxed) {
+                self.ahead.plan(&misses)
+            } else {
+                Vec::new()
+            };
             let mut fetched = self
                 .inner
                 .get_byte_ranges(misses.iter().chain(&ahead).cloned().collect())
@@ -342,6 +376,7 @@ pub fn snapshot() -> ParquetScanMetrics {
         files_planned: FILES_PLANNED.load(Relaxed),
         bytes_planned: BYTES_PLANNED.load(Relaxed),
         selected_row_groups: SELECTED_ROW_GROUPS.load(Relaxed),
+        plan_phase_us: std::array::from_fn(|i| PLAN_PHASE_US[i].load(Relaxed)),
     }
 }
 

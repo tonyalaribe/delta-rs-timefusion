@@ -416,7 +416,10 @@ impl TableProviderBuilder {
     }
 
     /// See [`next::DeltaScan::with_row_ordinal_selections`].
-    pub fn with_row_ordinal_selections(mut self, selections: std::collections::HashMap<String, Vec<u64>>) -> Self {
+    pub fn with_row_ordinal_selections(
+        mut self,
+        selections: std::collections::HashMap<String, Vec<u64>>,
+    ) -> Self {
         self.row_ordinal_selections = Some(selections);
         self
     }

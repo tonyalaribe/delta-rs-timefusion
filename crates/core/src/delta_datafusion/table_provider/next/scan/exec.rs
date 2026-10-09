@@ -22,7 +22,9 @@ use datafusion::common::{
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::collect_columns;
-use datafusion::physical_expr::{Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr,
+};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -30,7 +32,8 @@ use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
     InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, Statistics,
-    coalesce_partitions::CoalescePartitionsExec, sorts::sort_preserving_merge::SortPreservingMergeExec, union::UnionExec,
+    coalesce_partitions::CoalescePartitionsExec,
+    sorts::sort_preserving_merge::SortPreservingMergeExec, union::UnionExec,
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
@@ -190,7 +193,9 @@ fn plan_properties(
         .output_ordering()
         .and_then(|ordering| remap_ordering_to_schema(ordering, output_schema))
     {
-        Some(ordering) => EquivalenceProperties::new_with_orderings(Arc::clone(output_schema), [ordering]),
+        Some(ordering) => {
+            EquivalenceProperties::new_with_orderings(Arc::clone(output_schema), [ordering])
+        }
         None => EquivalenceProperties::new(Arc::clone(output_schema)),
     };
     Arc::new(PlanProperties::new(
@@ -307,12 +312,16 @@ impl DeltaScanExec {
             }
             // A pushed filter skips rows, so it is only sound on files no keep-mask indexes.
             if config.file_source.filter().is_some()
-                && config.file_groups.iter().flat_map(|g| g.iter()).any(|file| {
-                    file.partition_values
-                        .first()
-                        .and_then(|v| super::scalar_file_id(v))
-                        .is_none_or(|id| masks.contains_key(id))
-                })
+                && config
+                    .file_groups
+                    .iter()
+                    .flat_map(|g| g.iter())
+                    .any(|file| {
+                        file.partition_values
+                            .first()
+                            .and_then(|v| super::scalar_file_id(v))
+                            .is_none_or(|id| masks.contains_key(id))
+                    })
             {
                 return plan_err!(
                     "DeltaScanExec rejects file source filters over deletion-vector-masked files"
@@ -321,7 +330,10 @@ impl DeltaScanExec {
 
             for group in &config.file_groups {
                 for file in group.iter() {
-                    let Some(file_id) = file.partition_values.first().and_then(|v| super::scalar_file_id(v))
+                    let Some(file_id) = file
+                        .partition_values
+                        .first()
+                        .and_then(|v| super::scalar_file_id(v))
                     else {
                         return plan_err!(
                             "A sequential deletion vector file lacks a compact file id"
@@ -2045,7 +2057,9 @@ mod tests {
         let provider = table.table_provider().await?;
         // More target partitions than file groups, and a batch size the fixture's rows exceed so
         // a round-robin repartition looks beneficial: nothing may split a masked file to fill them.
-        let config = SessionConfig::new().with_target_partitions(4).with_batch_size(1);
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .with_batch_size(1);
         let session = Arc::new(datafusion::prelude::SessionContext::new_with_config(config));
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
@@ -2139,7 +2153,10 @@ mod tests {
         // Each file group masks its own whole files, so the scan keeps one stream per group
         // instead of funnelling every group through a single merged stream.
         assert!(
-            optimized_scan.input.downcast_ref::<DataSourceExec>().is_some(),
+            optimized_scan
+                .input
+                .downcast_ref::<DataSourceExec>()
+                .is_some(),
             "a DV scan must read its file groups in parallel:\n{}",
             datafusion::physical_plan::displayable(optimized.as_ref()).indent(true)
         );

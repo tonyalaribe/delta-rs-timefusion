@@ -585,7 +585,10 @@ impl DeltaScan {
     /// Matching files get a `ParquetAccessPlan` so the reader skips non-selected row groups
     /// and rows. Non-matching files, footer fetch failures, out-of-range ordinals, and scans
     /// carrying deletion-vector masks fall back to full-file reads.
-    pub fn with_row_ordinal_selections(mut self, selections: std::collections::HashMap<String, Vec<u64>>) -> Self {
+    pub fn with_row_ordinal_selections(
+        mut self,
+        selections: std::collections::HashMap<String, Vec<u64>>,
+    ) -> Self {
         self.row_ordinal_selections = Some(Arc::new(selections));
         self
     }
@@ -751,7 +754,9 @@ impl TableProvider for DeltaScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use crate::delta_datafusion::parquet_metrics::{PlanPhase, record_plan_phase};
         self.ensure_read_ready(session)?;
+        let started = std::time::Instant::now();
         let engine = DataFusionEngine::new_from_session(session);
         let contract = ProjectedScanContract::try_new(
             self.scan_schema.clone(),
@@ -768,10 +773,13 @@ impl TableProvider for DeltaScan {
             &self.config,
             self.file_skipping_predicate.clone(),
         )?;
+        record_plan_phase(PlanPhase::KernelPlan, started);
 
+        let started = std::time::Instant::now();
         let resolved_file_selection = self
             .resolve_file_selection(self.file_selection.as_ref(), engine.clone())
             .await?;
+        record_plan_phase(PlanPhase::FileSelection, started);
         let stream = self.scan_metadata_stream(&scan_plan, engine.clone());
 
         scan::execution_plan(
