@@ -1,14 +1,16 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering::Relaxed},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
 };
 
 use bytes::Bytes;
 use datafusion::{
-    common::{HashMap, TableReference},
     datasource::physical_plan::parquet::{
         CachedParquetFileReaderFactory, ParquetFileReaderFactory,
     },
+    common::{HashMap, TableReference},
     execution::cache::{
         Cache, CacheEntryInfo,
         cache_manager::{CachedFileMetadataEntry, FileMetadataCache},
@@ -22,10 +24,7 @@ use parquet::{
     arrow::{arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
     errors::Result as ParquetResult,
 };
-use std::{
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::{ops::Range, time::{Duration, Instant}};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ParquetScanMetrics {
@@ -135,133 +134,25 @@ impl ParquetFileReaderFactory for InstrumentedParquetFileReaderFactory {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion::common::Result<Box<dyn AsyncFileReader + Send>> {
-        Ok(Box::new(InstrumentedParquetFileReader::new(
-            self.inner.create_reader(
+        Ok(Box::new(InstrumentedParquetFileReader {
+            inner: self.inner.create_reader(
                 partition_index,
                 partitioned_file,
                 metadata_size_hint,
                 metrics,
             )?,
-        )))
+        }))
     }
 }
 
 struct InstrumentedParquetFileReader {
     inner: Box<dyn AsyncFileReader + Send>,
-    ahead: ReadAhead,
-}
-
-impl InstrumentedParquetFileReader {
-    fn new(inner: Box<dyn AsyncFileReader + Send>) -> Self {
-        Self {
-            inner,
-            ahead: ReadAhead::default(),
-        }
-    }
-}
-
-/// Per-reader budget for column chunks fetched ahead of the row group that asked.
-const READ_AHEAD_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Column-chunk read-ahead. The parquet reader fetches one row group's column chunks
-/// per `get_byte_ranges` call, one call after another, so a file of N row groups costs
-/// N sequential object-store round trips per column set (~0.5 s each on prod's store).
-/// When a call reads most of a column's chunk, the same column's chunks in the next row
-/// groups ride along in that call's batch; later calls are served from them.
-#[derive(Default)]
-struct ReadAhead {
-    metadata: Option<Arc<parquet::file::metadata::ParquetMetaData>>,
-    /// Fetched chunks by byte range, oldest first.
-    chunks: Vec<(Range<u64>, Bytes)>,
-}
-
-impl ReadAhead {
-    fn serve(&self, range: &Range<u64>) -> Option<Bytes> {
-        self.chunks
-            .iter()
-            .find(|(chunk, _)| chunk.start <= range.start && range.end <= chunk.end)
-            .map(|(chunk, bytes)| {
-                bytes
-                    .slice((range.start - chunk.start) as usize..(range.end - chunk.start) as usize)
-            })
-    }
-
-    /// Chunks to fetch alongside `misses`: for each column a miss reads at least half
-    /// of, that column's chunks in the following row groups, nearest first, in budget.
-    fn plan(&self, misses: &[Range<u64>]) -> Vec<Range<u64>> {
-        let Some(metadata) = self.metadata.as_ref() else {
-            return Vec::new();
-        };
-        let chunk_range = |rg: usize, col: usize| {
-            let (start, len) = metadata.row_group(rg).column(col).byte_range();
-            start..start + len
-        };
-        let overlap =
-            |a: &Range<u64>, b: &Range<u64>| a.end.min(b.end).saturating_sub(a.start.max(b.start));
-        let mut read: HashMap<(usize, usize), u64> = HashMap::new();
-        for miss in misses {
-            for rg in 0..metadata.num_row_groups() {
-                for col in 0..metadata.row_group(rg).num_columns() {
-                    let covered = overlap(miss, &chunk_range(rg, col));
-                    if covered > 0 {
-                        *read.entry((rg, col)).or_default() += covered;
-                    }
-                }
-            }
-        }
-        let columns: Vec<usize> = read
-            .iter()
-            .filter(|((rg, col), bytes)| {
-                2 * **bytes >= chunk_range(*rg, *col).end - chunk_range(*rg, *col).start
-            })
-            .map(|(&(_, col), _)| col)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let Some(&last) = read.keys().map(|(rg, _)| rg).max() else {
-            return Vec::new();
-        };
-        let mut budget = READ_AHEAD_BYTES;
-        let mut ahead = Vec::new();
-        'groups: for rg in last + 1..metadata.num_row_groups() {
-            for &col in &columns {
-                let chunk = chunk_range(rg, col);
-                let len = chunk.end - chunk.start;
-                if self.serve(&chunk).is_some() {
-                    continue;
-                }
-                if len > budget {
-                    break 'groups;
-                }
-                budget -= len;
-                ahead.push(chunk);
-            }
-        }
-        ahead
-    }
-
-    fn keep(&mut self, fetched: impl IntoIterator<Item = (Range<u64>, Bytes)>) {
-        self.chunks.extend(fetched);
-        // Oldest out first: the reader moves forward through the file.
-        let mut held: u64 = self
-            .chunks
-            .iter()
-            .map(|(range, _)| range.end - range.start)
-            .sum();
-        while held > 2 * READ_AHEAD_BYTES && !self.chunks.is_empty() {
-            let (range, _) = self.chunks.remove(0);
-            held -= range.end - range.start;
-        }
-    }
 }
 
 impl AsyncFileReader for InstrumentedParquetFileReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
         let started = Instant::now();
         async move {
-            if let Some(bytes) = self.ahead.serve(&range) {
-                return Ok(bytes);
-            }
             let result = self.inner.get_bytes(range).await;
             if let Ok(bytes) = &result {
                 record_read(bytes.len(), started.elapsed().as_micros() as u64);
@@ -280,33 +171,14 @@ impl AsyncFileReader for InstrumentedParquetFileReader {
     {
         let started = Instant::now();
         async move {
-            let served: Vec<Option<Bytes>> =
-                ranges.iter().map(|range| self.ahead.serve(range)).collect();
-            let misses: Vec<Range<u64>> = ranges
-                .iter()
-                .zip(&served)
-                .filter(|(_, hit)| hit.is_none())
-                .map(|(range, _)| range.clone())
-                .collect();
-            if misses.is_empty() {
-                return Ok(served.into_iter().flatten().collect());
+            let result = self.inner.get_byte_ranges(ranges).await;
+            if let Ok(bytes) = &result {
+                record_read(
+                    bytes.iter().map(Bytes::len).sum(),
+                    started.elapsed().as_micros() as u64,
+                );
             }
-            let ahead = self.ahead.plan(&misses);
-            let mut fetched = self
-                .inner
-                .get_byte_ranges(misses.iter().chain(&ahead).cloned().collect())
-                .await?;
-            record_read(
-                fetched.iter().map(Bytes::len).sum(),
-                started.elapsed().as_micros() as u64,
-            );
-            let extra = fetched.split_off(misses.len());
-            self.ahead.keep(ahead.into_iter().zip(extra));
-            let mut fetched = fetched.into_iter();
-            Ok(served
-                .into_iter()
-                .map(|hit| hit.or_else(|| fetched.next()).unwrap_or_default())
-                .collect())
+            result
         }
         .boxed()
     }
@@ -315,12 +187,7 @@ impl AsyncFileReader for InstrumentedParquetFileReader {
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<parquet::file::metadata::ParquetMetaData>>> {
-        async move {
-            let metadata = self.inner.get_metadata(options).await?;
-            self.ahead.metadata = Some(Arc::clone(&metadata));
-            Ok(metadata)
-        }
-        .boxed()
+        self.inner.get_metadata(options)
     }
 }
 
@@ -359,122 +226,4 @@ pub(crate) fn record_scan(files: usize, bytes: u64) {
 
 pub(crate) fn record_selected_row_groups(count: usize) {
     SELECTED_ROW_GROUPS.fetch_add(count as u64, Relaxed);
-}
-
-#[cfg(test)]
-mod read_ahead_tests {
-    use std::sync::atomic::AtomicUsize;
-
-    use arrow::{
-        array::{Int64Array, RecordBatch, StringArray},
-        datatypes::{DataType, Field, Schema},
-    };
-    use futures::TryStreamExt;
-    use parquet::{
-        arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask},
-        file::{metadata::ParquetMetaDataReader, properties::WriterProperties},
-    };
-
-    use super::*;
-
-    /// An in-memory file that counts `get_byte_ranges` calls: one call is one round trip.
-    struct Counting(Bytes, Arc<AtomicUsize>);
-
-    impl AsyncFileReader for Counting {
-        fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-            self.1.fetch_add(1, Relaxed);
-            let bytes = self.0.slice(range.start as usize..range.end as usize);
-            async move { Ok(bytes) }.boxed()
-        }
-
-        fn get_byte_ranges(
-            &mut self,
-            ranges: Vec<Range<u64>>,
-        ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-            self.1.fetch_add(1, Relaxed);
-            let bytes = ranges
-                .iter()
-                .map(|range| self.0.slice(range.start as usize..range.end as usize))
-                .collect();
-            async move { Ok(bytes) }.boxed()
-        }
-
-        fn get_metadata<'a>(
-            &'a mut self,
-            _: Option<&'a ArrowReaderOptions>,
-        ) -> BoxFuture<'a, ParquetResult<Arc<parquet::file::metadata::ParquetMetaData>>> {
-            let metadata = ParquetMetaDataReader::new()
-                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
-                .parse_and_finish(&self.0);
-            async move { Ok(Arc::new(metadata?)) }.boxed()
-        }
-    }
-
-    /// Twenty row groups of `(n, label)`.
-    fn file() -> Bytes {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("n", DataType::Int64, false),
-            Field::new("label", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from_iter_values(0..2000)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..2000).map(|i| format!("row-{i}")),
-                )),
-            ],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        let mut writer = ArrowWriter::try_new(
-            &mut out,
-            schema,
-            Some(
-                WriterProperties::builder()
-                    .set_max_row_group_row_count(Some(100))
-                    .build(),
-            ),
-        )
-        .unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(out)
-    }
-
-    async fn read(reader: impl AsyncFileReader + Unpin + Send + 'static) -> Vec<RecordBatch> {
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
-        let mask = ProjectionMask::roots(builder.parquet_schema(), [1]);
-        builder
-            .with_projection(mask)
-            .build()
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap()
-    }
-
-    /// Same batches, a fraction of the round trips: a column the reader takes whole
-    /// rides ahead into the next row groups.
-    #[tokio::test]
-    async fn read_ahead_returns_the_same_rows_in_fewer_round_trips() {
-        let (plain_calls, ahead_calls) =
-            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let plain = read(Counting(file(), Arc::clone(&plain_calls))).await;
-        let ahead = read(InstrumentedParquetFileReader::new(Box::new(Counting(
-            file(),
-            Arc::clone(&ahead_calls),
-        ))))
-        .await;
-        assert_eq!(ahead, plain);
-        let (plain_calls, ahead_calls) = (plain_calls.load(Relaxed), ahead_calls.load(Relaxed));
-        assert!(
-            plain_calls >= 20,
-            "one round trip per row group without read-ahead, got {plain_calls}"
-        );
-        assert!(
-            ahead_calls * 4 <= plain_calls,
-            "read-ahead took {ahead_calls} round trips against {plain_calls}"
-        );
-    }
 }
