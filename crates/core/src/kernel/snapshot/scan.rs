@@ -512,7 +512,11 @@ impl Scan {
                     existing_predicate,
                 )
             }
-            None => self.scan_metadata(engine),
+            None => {
+                #[cfg(feature = "datafusion")]
+                crate::delta_datafusion::parquet_metrics::record_unseeded_replay();
+                self.scan_metadata(engine)
+            }
         }
     }
 

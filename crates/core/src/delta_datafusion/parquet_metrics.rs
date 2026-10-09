@@ -39,6 +39,8 @@ pub struct ParquetScanMetrics {
     pub selected_row_groups: u64,
     /// Microseconds `DeltaScan::scan` spent per planning phase, see [`PlanPhase`].
     pub plan_phase_us: [u64; PlanPhase::COUNT],
+    /// Scans whose file replay could not seed from materialized files and re-read the log.
+    pub unseeded_replays: u64,
 }
 
 /// Where `DeltaScan::scan` spends its planning time.
@@ -64,6 +66,11 @@ impl PlanPhase {
 
 static PLAN_PHASE_US: [AtomicU64; PlanPhase::COUNT] =
     [const { AtomicU64::new(0) }; PlanPhase::COUNT];
+static UNSEEDED_REPLAYS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_unseeded_replay() {
+    UNSEEDED_REPLAYS.fetch_add(1, Relaxed);
+}
 
 pub(crate) fn record_plan_phase(phase: PlanPhase, started: Instant) {
     PLAN_PHASE_US[phase as usize].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
@@ -377,6 +384,7 @@ pub fn snapshot() -> ParquetScanMetrics {
         bytes_planned: BYTES_PLANNED.load(Relaxed),
         selected_row_groups: SELECTED_ROW_GROUPS.load(Relaxed),
         plan_phase_us: std::array::from_fn(|i| PLAN_PHASE_US[i].load(Relaxed)),
+        unseeded_replays: UNSEEDED_REPLAYS.load(Relaxed),
     }
 }
 
