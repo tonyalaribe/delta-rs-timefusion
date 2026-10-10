@@ -44,16 +44,24 @@ use url::Url;
 
 use super::{Action, CommitInfo, Metadata, Protocol};
 use crate::checkpoints::parse_last_checkpoint_hint;
+#[cfg(feature = "datafusion")]
+use crate::kernel::arrow::engine_ext::SnapshotExt as _;
 use crate::kernel::arrow::engine_ext::{ExpressionEvaluatorExt, rb_from_scan_meta};
 use crate::kernel::{ARROW_HANDLER, StructType, spawn_blocking_with_span};
 use crate::logstore::{LogStore, LogStoreExt};
 use crate::{DeltaResult, DeltaTableError};
 
 pub use self::log_data::*;
+#[cfg(feature = "datafusion")]
+use self::stats_projection::FIELD_PARTITION_VALUES_PARSED;
 use self::stats_projection::FIELD_STATS;
 pub(crate) use self::stats_projection::{
     FIELD_STATS_PARSED, FileStatsMaterialization, StatsProjection,
 };
+#[cfg(feature = "datafusion")]
+use arrow::array::AsArray as _;
+#[cfg(feature = "datafusion")]
+use delta_kernel::expressions::{BinaryPredicateOp, JunctionPredicateOp, Predicate, Scalar};
 pub use iterators::*;
 pub use scan::*;
 pub use stream::*;
@@ -1356,6 +1364,120 @@ impl MaterializedFiles {
             }),
         }
     }
+
+    /// The full-table seed narrowed to the files of the partition `predicate` pins by equality.
+    /// Exact: replay would prune every other partition's files against that predicate anyway,
+    /// but only after parsing their stats.
+    #[cfg(feature = "datafusion")]
+    fn pinned_seed(
+        &self,
+        snapshot: &KernelSnapshot,
+        predicate: Option<&Predicate>,
+    ) -> Option<MaterializedFilesSeed> {
+        let mut seed = self.full_table_seed()?;
+        let Some((column, value)) = predicate.and_then(|p| partition_pin(snapshot, p)) else {
+            return Some(seed);
+        };
+        let value_key = format!("{value:?}");
+        let is_key = |(owner, c, v): &PinnedSeedKey| {
+            std::ptr::addr_eq(owner.as_ptr(), Arc::as_ptr(&self.batches))
+                && *c == column
+                && *v == value_key
+        };
+        let cached = {
+            let mut cache = PINNED_SEEDS.lock();
+            let hit = cache.iter().position(|(k, _)| is_key(k));
+            hit.and_then(|i| cache.remove(i))
+                .inspect(|entry| cache.push_back(entry.clone()))
+        };
+        let batches = match cached {
+            Some((_, batches)) => batches,
+            None => {
+                let Some(batches) = filter_partition(&seed.batches, &column, &value) else {
+                    return Some(seed);
+                };
+                let mut cache = PINNED_SEEDS.lock();
+                cache.retain(|((owner, ..), _)| owner.strong_count() > 0);
+                if cache.len() >= PINNED_SEED_CAPACITY {
+                    cache.pop_front();
+                }
+                let owner = Arc::downgrade(&self.batches);
+                cache.push_back(((owner, column, value_key), batches.clone()));
+                batches
+            }
+        };
+        seed.batches = batches;
+        Some(seed)
+    }
+}
+
+/// Keyed by the owning materialization's allocation, which the `Weak` keeps from being reused.
+#[cfg(feature = "datafusion")]
+type PinnedSeedKey = (std::sync::Weak<[RecordBatch]>, String, String);
+#[cfg(feature = "datafusion")]
+type PinnedSeeds = std::collections::VecDeque<(PinnedSeedKey, Arc<[RecordBatch]>)>;
+
+#[cfg(feature = "datafusion")]
+const PINNED_SEED_CAPACITY: usize = 32;
+
+/// LRU of partition-narrowed seeds; repeat scans of one tenant skip even the partition filter.
+#[cfg(feature = "datafusion")]
+static PINNED_SEEDS: LazyLock<parking_lot::Mutex<PinnedSeeds>> = LazyLock::new(Default::default);
+
+/// The logical partition column and value an AND-ed `column = literal` conjunct pins.
+#[cfg(feature = "datafusion")]
+fn partition_pin(snapshot: &KernelSnapshot, predicate: &Predicate) -> Option<(String, Scalar)> {
+    match predicate {
+        Predicate::Junction(j) if j.op == JunctionPredicateOp::And => {
+            j.preds.iter().find_map(|p| partition_pin(snapshot, p))
+        }
+        Predicate::Binary(b) if b.op == BinaryPredicateOp::Equal => {
+            let ((Expression::Column(column), Expression::Literal(value))
+            | (Expression::Literal(value), Expression::Column(column))) =
+                (b.left.as_ref(), b.right.as_ref())
+            else {
+                return None;
+            };
+            let [physical] = column.path() else {
+                return None;
+            };
+            let config = snapshot.table_configuration();
+            let mode = config.column_mapping_mode();
+            let field = config
+                .partitions_schema()
+                .ok()??
+                .fields()
+                .find(|f| f.physical_name(mode) == physical)?
+                .name()
+                .clone();
+            (!value.is_null()).then(|| (field, value.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Keep rows whose `partitionValues_parsed.column` equals `value`; `None` (full seed) when the
+/// column is absent or the literal's type does not compare.
+#[cfg(feature = "datafusion")]
+fn filter_partition(
+    batches: &[RecordBatch],
+    column: &str,
+    value: &Scalar,
+) -> Option<Arc<[RecordBatch]>> {
+    let value = arrow::array::Scalar::new(value.to_array(1).ok()?);
+    batches
+        .iter()
+        .map(|batch| {
+            let values = batch
+                .column_by_name(FIELD_PARTITION_VALUES_PARSED)?
+                .as_struct_opt()?
+                .column_by_name(column)?;
+            let keep = arrow::compute::kernels::cmp::eq(values, &value).ok()?;
+            filter_record_batch(batch, &keep).ok()
+        })
+        .filter(|batch| batch.as_ref().is_none_or(|b| b.num_rows() > 0))
+        .collect::<Option<Vec<_>>>()
+        .map(Into::into)
 }
 
 /// A snapshot of a Delta table that has been eagerly loaded into memory.

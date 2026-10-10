@@ -1950,6 +1950,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partition_pinned_replay_seeds_only_the_pinned_partition() -> TestResult {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("project", ArrowDataType::Utf8, true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let mut table = crate::DeltaTable::new_in_memory();
+        for round in 0..3 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["p0", "p1", "p2", "p3"])),
+                    Arc::new(Int32Array::from_iter_values((0..4).map(|p| round * 10 + p))),
+                ],
+            )?;
+            table = table
+                .write(vec![batch])
+                .with_partition_columns(vec!["project"])
+                .await?;
+        }
+        let log_store = table.log_store();
+        let eager = table.snapshot()?.snapshot().clone();
+        let materialized = eager.snapshot().materialized_files().expect("materialized");
+        let total: usize = materialized.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 12);
+
+        let config = DeltaScanConfig::default();
+        let pinned = col("project").eq(lit("p1"));
+        let seed_rows = |filters: &[Expr]| -> TestResult<usize> {
+            let plan = KernelScanPlan::try_new(eager.snapshot(), None, filters, &config, None)?;
+            Ok(plan.scan.seed_rows_for_test(materialized))
+        };
+        assert_eq!(seed_rows(std::slice::from_ref(&pinned))?, 3);
+        assert_eq!(
+            seed_rows(&[pinned.clone().and(col("value").gt(lit(5)))])?,
+            3
+        );
+        assert_eq!(
+            seed_rows(&[pinned.clone().or(col("project").eq(lit("p2")))])?,
+            total
+        );
+        assert_eq!(seed_rows(&[])?, total);
+
+        let fresh = Snapshot::try_new(&log_store, None).await?;
+        let session = Arc::new(create_session().into_inner());
+        let state = session.state_ref().read().clone();
+        for filter in [pinned.clone(), pinned.and(col("value").gt(lit(5)))] {
+            let mut results = vec![];
+            for snapshot in [SnapshotWrapper::from(eager.clone()), fresh.clone().into()] {
+                let provider =
+                    DeltaScan::new(snapshot, config.clone())?.with_log_store(log_store.clone());
+                let plan = provider
+                    .scan(&state, None, std::slice::from_ref(&filter), None)
+                    .await?;
+                let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
+                results.push(arrow::util::pretty::pretty_format_batches(&batches)?.to_string());
+            }
+            assert_eq!(results[0], results[1], "{filter}");
+            assert!(
+                results[0].contains("p1") && !results[0].contains("p2"),
+                "{filter}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_scan_with_file_selection_files_uses_snapshot_metadata_for_mutated_add()
     -> TestResult {
         let schema = Arc::new(ArrowSchema::new(vec![

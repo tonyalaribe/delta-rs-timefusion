@@ -494,15 +494,34 @@ impl Scan {
         builder.build()
     }
 
+    #[cfg(all(test, feature = "datafusion"))]
+    pub(crate) fn seed_rows_for_test(&self, materialized_files: &MaterializedFiles) -> usize {
+        let predicate = self.physical_predicate();
+        materialized_files
+            .pinned_seed(self.snapshot(), predicate.as_deref())
+            .map_or(0, |seed| {
+                seed.batches.iter().map(RecordBatch::num_rows).sum()
+            })
+    }
+
     #[cfg(feature = "datafusion")]
     pub(crate) fn scan_metadata_seeded(
         &self,
         engine: Arc<dyn Engine>,
         materialized_files: Option<&Arc<MaterializedFiles>>,
     ) -> SendableScanMetadataStream {
-        match materialized_files.and_then(|materialized_files| materialized_files.full_table_seed())
-        {
+        let predicate = self.physical_predicate();
+        match materialized_files.and_then(|materialized_files| {
+            materialized_files.pinned_seed(self.snapshot(), predicate.as_deref())
+        }) {
             Some(materialized_seed) => {
+                crate::delta_datafusion::parquet_metrics::record_replay_seed_rows(
+                    materialized_seed
+                        .batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum(),
+                );
                 let (existing_version, existing_data, existing_predicate) =
                     materialized_seed.into_parts();
                 self.scan_metadata_from(

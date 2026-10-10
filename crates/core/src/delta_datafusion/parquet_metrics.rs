@@ -41,6 +41,8 @@ pub struct ParquetScanMetrics {
     pub plan_phase_us: [u64; PlanPhase::COUNT],
     /// Scans whose file replay could not seed from materialized files and re-read the log.
     pub unseeded_replays: u64,
+    /// Materialized file rows fed to seeded replays (after partition-pin narrowing).
+    pub replay_seed_rows: u64,
 }
 
 /// Where `DeltaScan::scan` spends its planning time.
@@ -70,6 +72,12 @@ static UNSEEDED_REPLAYS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_unseeded_replay() {
     UNSEEDED_REPLAYS.fetch_add(1, Relaxed);
+}
+
+static REPLAY_SEED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_replay_seed_rows(rows: usize) {
+    REPLAY_SEED_ROWS.fetch_add(rows as u64, Relaxed);
 }
 
 pub(crate) fn record_plan_phase(phase: PlanPhase, started: Instant) {
@@ -385,6 +393,7 @@ pub fn snapshot() -> ParquetScanMetrics {
         selected_row_groups: SELECTED_ROW_GROUPS.load(Relaxed),
         plan_phase_us: std::array::from_fn(|i| PLAN_PHASE_US[i].load(Relaxed)),
         unseeded_replays: UNSEEDED_REPLAYS.load(Relaxed),
+        replay_seed_rows: REPLAY_SEED_ROWS.load(Relaxed),
     }
 }
 
