@@ -50,7 +50,7 @@ jobs:
   build:
     needs: test-matrix
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.test-matrix.outputs.targets) }}
     runs-on: ${{ matrix.os }}
@@ -85,7 +85,7 @@ jobs:
     name: Unit Tests
     needs: test-matrix
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.test-matrix.outputs.targets) }}
     runs-on: ${{ matrix.os }}
@@ -137,10 +137,6 @@ jobs:
             --exclude deltalake-hdfs \
             --exclude deltalake-lakefs
 
-      - uses: ./.github/actions/upload-coverage
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
       - name: Run doc tests
         shell: bash
         # llvm-cov doesn't run doc tests on stable, so run them separately.
@@ -157,3 +153,7 @@ jobs:
             --exclude deltalake-hdfs \
             --exclude deltalake-lakefs \
             --doc
+
+      - uses: ./.github/actions/upload-coverage
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
