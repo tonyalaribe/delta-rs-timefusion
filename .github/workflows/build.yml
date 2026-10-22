@@ -89,6 +89,9 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.test-matrix.outputs.targets) }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
     env:
       DEFAULT_FEATURES: "datafusion"
       # Doc tests are built with the dev profile, whereas llvm-cov
