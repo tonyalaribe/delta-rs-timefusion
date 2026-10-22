@@ -20,6 +20,9 @@ env:
 jobs:
   cloud:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
     strategy:
       fail-fast: false
@@ -97,6 +100,9 @@ jobs:
   hdfs:
     name: Integration Tests (HDFS)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       # v6.0.2
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -132,6 +138,9 @@ jobs:
   lakefs:
     name: Integration Tests (LakeFS v1.48)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       # v6.0.2

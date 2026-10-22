@@ -67,3 +67,10 @@ runs:
         cache: true
         # if we ever get rid of all the clippy warnings, we can remove this line
         rustflags: ""
+
+    # sccache 0.18 rebuilds /Tp inputs as `-Tp /WX- source.cc`, breaking MSVC.
+    # Remove this workaround after a release includes upstream fix d90e22c.
+    - name: Invoke Windows compilers directly
+      if: runner.os == 'Windows'
+      shell: bash
+      run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
