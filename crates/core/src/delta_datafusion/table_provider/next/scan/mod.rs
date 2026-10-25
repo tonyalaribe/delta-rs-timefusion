@@ -539,12 +539,16 @@ fn sort_column_footer_stats(
     column_index: usize,
 ) -> Option<(ScalarValue, ScalarValue, usize)> {
     use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
-    let converter = StatisticsConverter::try_new(
-        read_schema.field(column_index).name(),
-        read_schema,
-        meta.file_metadata().schema_descr(),
-    )
-    .ok()?;
+    // The read schema can be projected or reordered; its ordinal is not the
+    // physical Parquet ordinal. Match the complete top-level column path first.
+    let parquet_schema = meta.file_metadata().schema_descr();
+    let field = read_schema.field(column_index);
+    let parquet_index = parquet_schema
+        .columns()
+        .iter()
+        .position(|column| column.path().parts() == std::slice::from_ref(field.name()))?;
+    let converter =
+        StatisticsConverter::from_column_index(parquet_index, field, parquet_schema).ok()?;
     let row_groups = meta.row_groups();
     let mins = converter.row_group_mins(row_groups.iter()).ok()?;
     let maxes = converter.row_group_maxes(row_groups.iter()).ok()?;
@@ -1921,6 +1925,51 @@ mod tests {
             repacked.output_ordering().is_some(),
             "repacked groups must keep the declared ordering through validation"
         );
+    }
+
+    #[test]
+    fn test_projected_sort_stats_use_physical_columns() -> TestResult {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "unrelated",
+                Arc::new(StringArray::from(vec!["wrong-z", "wrong-a"])) as ArrayRef,
+            ),
+            (
+                "timestamp",
+                Arc::new(Int64Array::from(vec![20, 10])) as ArrayRef,
+            ),
+            (
+                "metric_name",
+                Arc::new(StringArray::from(vec!["metric-a", "metric-z"])) as ArrayRef,
+            ),
+            (
+                "series_id",
+                Arc::new(StringArray::from(vec!["series-a", "series-z"])) as ArrayRef,
+            ),
+        ])?;
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes::Bytes::from(buffer))?;
+        let projected = Arc::new(Schema::new(vec![
+            Field::new("metric_name", DataType::Utf8View, false),
+            Field::new("series_id", DataType::Utf8View, false),
+        ]));
+        for (column, minimum, maximum) in [(0, "metric-a", "metric-z"), (1, "series-a", "series-z")]
+        {
+            assert_eq!(
+                sort_column_footer_stats(&metadata, &projected, column),
+                Some((
+                    ScalarValue::Utf8View(Some(minimum.into())),
+                    ScalarValue::Utf8View(Some(maximum.into())),
+                    0,
+                )),
+                "projected ordinals must not read another column's bounds"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]

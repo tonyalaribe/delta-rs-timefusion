@@ -1,7 +1,8 @@
 name: Upload to codecov
 inputs:
   token:
-    required: true
+    description: Optional legacy upload token; an empty token selects GitHub OIDC
+    required: false
     type: string
 runs:
   using: "composite"
@@ -12,5 +13,6 @@ runs:
       with:
         files: codecov.json
         fail_ci_if_error: true
+        use_oidc: ${{ inputs.token == '' }}
       env:
         CODECOV_TOKEN: ${{ inputs.token }}
