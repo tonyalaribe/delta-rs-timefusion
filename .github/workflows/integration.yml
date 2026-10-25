@@ -100,6 +100,7 @@ jobs:
   hdfs:
     name: Integration Tests (HDFS)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
@@ -116,6 +117,9 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
+      - name: Check readiness transport and subprocess cleanup
+        run: timeout 20s python3 .github/scripts/test-hdfs-maven.py
+
       - name: Download Hadoop
         run: |
           wget -q https://dlcdn.apache.org/hadoop/common/hadoop-3.4.0/hadoop-3.4.0.tar.gz
@@ -125,11 +129,17 @@ jobs:
       - name: Run tests with rustls (default)
         run: |
           gmake setup-dat
-          cargo llvm-cov nextest --cargo-profile=ci \
-            --features integration_test \
-            --package deltalake-hdfs \
-            --codecov \
-            --output-path codecov.json
+          bash .github/scripts/run-hdfs-tests.sh
+
+      - name: Preserve HDFS diagnostics and generated coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hdfs-diagnostics
+          path: |
+            ${{ runner.temp }}/hdfs-diagnostics/
+            codecov.json
+          if-no-files-found: warn
 
       - uses: ./.github/actions/upload-coverage
         with:
