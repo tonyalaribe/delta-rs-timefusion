@@ -1,0 +1,45 @@
+name: HDFS startup diagnostic
+
+on:
+  push:
+    branches: [diagnostic/hdfs-startup-20261025]
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  DEFAULT_FEATURES: "azure,datafusion,s3,gcs,glue,hdfs "
+  RUSTFLAGS: ""
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: ./.github/actions/setup-builder
+      - uses: ./.github/actions/setup-coverage
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
+        with:
+          distribution: "temurin"
+          java-version: "17"
+      - name: Download Hadoop
+        run: |
+          wget -q https://dlcdn.apache.org/hadoop/common/hadoop-3.4.0/hadoop-3.4.0.tar.gz
+          tar -xf hadoop-3.4.0.tar.gz -C "$GITHUB_WORKSPACE"
+          echo "$GITHUB_WORKSPACE/hadoop-3.4.0/bin" >> "$GITHUB_PATH"
+      - name: Run the real HDFS tests with bounded startup diagnostics
+        run: |
+          gmake setup-dat
+          bash .github/scripts/hdfs-diagnostic.sh
+      - name: Preserve diagnostics and generated coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hdfs-startup-diagnostic
+          path: |
+            ${{ runner.temp }}/hdfs-diagnostics/
+            codecov.json
+          if-no-files-found: warn
