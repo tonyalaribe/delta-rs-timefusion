@@ -6,9 +6,12 @@ hdfs_bin="$RUNNER_TEMP/hdfs-diagnostic-bin"
 mkdir -p "$hdfs_diagnostics" "$hdfs_bin"
 export HDFS_REAL_MVN="$(command -v mvn)"
 export HDFS_MAVEN_STDERR_LOG="$hdfs_diagnostics/maven.stderr"
+# The first stdout line is a readiness protocol, so Hadoop logging uses stderr.
+export HDFS_MAVEN_LOGGING_OPTIONS="-Dlog4j.configuration=file:$GITHUB_WORKSPACE/.github/scripts/hdfs-log4j.properties -Dlog4j.configurationFile=file:$GITHUB_WORKSPACE/.github/scripts/hdfs-log4j2.xml"
 # MiniDfs discards Maven stderr. Forward the real command unchanged and retain it.
 cat > "$hdfs_bin/mvn" <<'MVN'
 #!/bin/sh
+export MAVEN_OPTS="${MAVEN_OPTS:-} $HDFS_MAVEN_LOGGING_OPTIONS"
 exec "$HDFS_REAL_MVN" "$@" 2>>"$HDFS_MAVEN_STDERR_LOG"
 MVN
 chmod +x "$hdfs_bin/mvn"
