@@ -23,6 +23,7 @@ def main():
 
     ready = False
     prelude_bytes = 0
+    forwarding = True
     with (diagnostics / 'maven.stderr').open('ab') as stderr, (diagnostics / 'maven.stdout-before-ready').open('ab') as prelude:
         child = subprocess.Popen([os.environ['HDFS_REAL_MVN'], *sys.argv[1:]], stdout=subprocess.PIPE, stderr=stderr, preexec_fn=supervise_child)
         (diagnostics / 'maven-child-pid').write_text(str(child.pid))
@@ -31,8 +32,18 @@ def main():
                 if not ready and line.rstrip(b'\r\n') == b'Ready!':
                     ready = True
                 if ready:
-                    sys.stdout.buffer.write(line)
-                    sys.stdout.buffer.flush()
+                    if forwarding:
+                        try:
+                            remaining = memoryview(line)
+                            while remaining:
+                                remaining = remaining[os.write(sys.stdout.fileno(), remaining):]
+                        except BrokenPipeError:
+                            # MiniDfs drops its readiness reader after startup.
+                            # Keep draining JVM logs without terminating the server.
+                            forwarding = False
+                    if not forwarding:
+                        stderr.write(line)
+                        stderr.flush()
                 else:
                     prelude.write(line)
                     prelude.flush()

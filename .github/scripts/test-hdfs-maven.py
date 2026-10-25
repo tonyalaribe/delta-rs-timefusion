@@ -14,6 +14,26 @@ with tempfile.TemporaryDirectory() as directory:
     assert (pathlib.Path(directory) / 'maven.stdout-before-ready').read_bytes() == b'startup diagnostic\n'
     missing = subprocess.run([sys.executable, str(wrapper), '-u', '-c', "print('startup failed')"], capture_output=True, env=env, timeout=10)
     assert missing.returncode != 0 and missing.stdout == b''
+    # Match MiniDfs: consume readiness, drop stdout, then use the live server.
+    server = subprocess.Popen([sys.executable, str(wrapper), '-u', '-c', "import sys; print('Ready!'); sys.stdin.readline(); print('late JVM log'); print('still alive', file=sys.stderr, flush=True); sys.stdin.readline()"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        assert server.stdout.readline() == b'Ready!\n'
+        server.stdout.close()
+        server.stdin.write(b'\n')
+        server.stdin.flush()
+        deadline = time.monotonic() + 5
+        while b'still alive' not in (pathlib.Path(directory) / 'maven.stderr').read_bytes():
+            assert time.monotonic() < deadline and server.poll() is None
+            time.sleep(0.05)
+        time.sleep(0.1)
+        assert server.poll() is None, 'closing readiness reader killed server'
+        server.stdin.write(b'\n')
+        server.stdin.flush()
+        assert server.wait(timeout=5) == 0
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
     child = subprocess.Popen([sys.executable, str(wrapper), '-u', '-c', "import time; print('Ready!'); time.sleep(60)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     try:
         assert child.stdout.readline() == b'Ready!\n'
