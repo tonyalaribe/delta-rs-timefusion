@@ -25,6 +25,8 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "17"
+      - name: Check readiness transport and subprocess cleanup
+        run: python3 .github/scripts/test-hdfs-maven.py
       - name: Download Hadoop
         run: |
           wget -q https://dlcdn.apache.org/hadoop/common/hadoop-3.4.0/hadoop-3.4.0.tar.gz
