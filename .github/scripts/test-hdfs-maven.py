@@ -17,8 +17,21 @@ with tempfile.TemporaryDirectory() as directory:
     child = subprocess.Popen([sys.executable, str(wrapper), '-u', '-c', "import time; print('Ready!'); time.sleep(60)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     try:
         assert child.stdout.readline() == b'Ready!\n'
+        real_pid = int((pathlib.Path(directory) / 'maven-child-pid').read_text())
+        proc = pathlib.Path('/proc') / str(real_pid) / 'stat'
+        started = proc.read_text().rsplit(')', 1)[1].split()[19]
         child.kill()
-        child.communicate(timeout=5)  # The JVM equivalent must close inherited pipes.
+        child.communicate(timeout=5)
+        deadline = time.monotonic() + 5
+        while proc.exists():
+            try:
+                state = proc.read_text().rsplit(')', 1)[1].split()
+            except FileNotFoundError:
+                break
+            if state[0] == 'Z' or state[19] != started:
+                break
+            assert time.monotonic() < deadline, 'real child survived wrapper death'
+            time.sleep(0.05)
     finally:
         if child.poll() is None:
             child.kill()
