@@ -206,6 +206,109 @@ fn plan_properties(
     ))
 }
 
+/// Project a kernel transform's logical outputs while preserving its actual field expressions.
+/// Expand only the top-level patch; nested patches retain their full input structs.
+fn project_scan_transform(
+    transform: &ExpressionRef,
+    physical_schema: &delta_kernel::schema::StructType,
+    indices: &[usize],
+) -> Option<ExpressionRef> {
+    use delta_kernel::Expression;
+    let (fields, keep) = match transform.as_ref() {
+        Expression::Struct(fields, keep) => (fields.clone(), keep.clone()),
+        Expression::StructPatch(patch) if patch.input_path.is_none() => {
+            let fields = patch
+                .prepended_fields
+                .iter()
+                .cloned()
+                .chain(physical_schema.fields().flat_map(|field| {
+                    let patch = patch.field_patches.get(field.name());
+                    patch
+                        .is_none_or(|patch| patch.keep_input)
+                        .then(|| Arc::new(Expression::column([field.name().clone()])))
+                        .into_iter()
+                        .chain(
+                            patch
+                                .into_iter()
+                                .flat_map(|patch| patch.insertions.iter().cloned()),
+                        )
+                }))
+                .chain(patch.appended_fields.iter().cloned())
+                .collect();
+            (fields, None)
+        }
+        _ => return None,
+    };
+    let projected = indices
+        .iter()
+        .map(|&i| fields.get(i).cloned())
+        .collect::<Option<Vec<_>>>()?;
+    Some(Arc::new(Expression::Struct(projected, keep)))
+}
+
+/// Kernel's default references visitor treats StructPatch as a leaf. Check its implicit
+/// input struct and its inserted expressions before removing any physical columns.
+fn scan_transform_dependencies_fit(
+    transform: &ExpressionRef,
+    schema: &delta_kernel::schema::StructType,
+) -> bool {
+    use delta_kernel::{
+        expressions::{ColumnName, ExpressionStructPatch, OpaqueExpression, OpaquePredicate},
+        transforms::{ExpressionTransform, transform_output_type},
+    };
+    struct Dependencies<'s> {
+        schema: &'s delta_kernel::schema::StructType,
+        supported: bool,
+    }
+    impl<'a> ExpressionTransform<'a> for Dependencies<'_> {
+        transform_output_type!(|'a, T| ());
+        fn transform_expr_column(&mut self, name: &'a ColumnName) {
+            self.supported &= name
+                .path()
+                .first()
+                .is_some_and(|name| self.schema.field(name).is_some());
+        }
+        fn transform_expr_struct_patch(&mut self, patch: &'a ExpressionStructPatch) {
+            if let Some(path) = &patch.input_path {
+                self.transform_expr_column(path);
+            } else {
+                self.supported = false;
+            }
+            for expression in patch
+                .prepended_fields
+                .iter()
+                .chain(
+                    patch
+                        .field_patches
+                        .values()
+                        .flat_map(|patch| &patch.insertions),
+                )
+                .chain(&patch.appended_fields)
+            {
+                self.transform_expr(expression);
+            }
+        }
+        fn transform_expr_opaque(&mut self, _expression: &'a OpaqueExpression) {
+            self.supported = false;
+        }
+        fn transform_expr_unknown(&mut self, _name: &'a String) {
+            self.supported = false;
+        }
+        fn transform_pred_opaque(&mut self, _predicate: &'a OpaquePredicate) {
+            self.supported = false;
+        }
+        fn transform_pred_unknown(&mut self, _name: &'a String) {
+            self.supported = false;
+        }
+    }
+    let mut dependencies = Dependencies {
+        schema,
+        supported: true,
+    };
+    dependencies.transform_expr(transform);
+    dependencies.supported
+}
+
 impl DeltaScanExec {
     pub(super) fn new(
         scan_plan: Arc<KernelScanPlan>,
@@ -552,6 +655,199 @@ impl ExecutionPlan for DeltaScanExec {
             children,
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
         )
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &datafusion::physical_plan::projection::ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        use datafusion::physical_expr::{
+            projection::{ProjectionExpr, update_expr},
+            utils::collect_columns,
+        };
+        use datafusion::physical_optimizer::{
+            PhysicalOptimizerRule, projection_pushdown::ProjectionPushdown,
+        };
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let requested: HashSet<_> = projection
+            .expr()
+            .iter()
+            .flat_map(|expr| collect_columns(&expr.expr))
+            .map(|column| self.schema().field(column.index()).name().clone())
+            .collect();
+        if requested.len() >= self.schema().fields().len() {
+            return Ok(None);
+        }
+        let old = &self.scan_plan;
+        let logical_indices: Vec<_> = old
+            .scan
+            .logical_schema()
+            .fields()
+            .enumerate()
+            .filter_map(|(i, field)| requested.contains(field.name()).then_some(i))
+            .collect();
+        // Empty kernel structs cannot preserve row counts through every transform.
+        // Keep the original reader for projections of only synthetic metadata columns.
+        if logical_indices.is_empty() {
+            return Ok(None);
+        }
+        let names: Vec<_> = logical_indices
+            .iter()
+            .map(|&i| old.contract.scan_schema.field(i).name().as_str())
+            .collect();
+        let logical = old
+            .scan
+            .logical_schema()
+            .project(&names)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Reuse the already-selected files, masks, and public identities. The new kernel
+        // scan describes only schemas; it never enumerates a newer table snapshot.
+        let scan = Arc::new(
+            crate::kernel::ScanBuilder::new(Arc::clone(old.scan.snapshot()))
+                .with_stats_materialization(old.scan.stats_materialization().clone())
+                .with_schema(logical)
+                .build()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        );
+        let physical_indices = scan
+            .physical_schema()
+            .fields()
+            .map(|field| old.parquet_read_schema.index_of(field.name()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let parquet_read_schema = Arc::new(old.parquet_read_schema.project(&physical_indices)?);
+        let kernel_type: KernelDataType = Arc::clone(scan.logical_schema()).into();
+        let mut transforms = HashMap::new();
+        for (file, transform) in self.transforms.iter() {
+            let Some(transform) =
+                project_scan_transform(transform, old.scan.physical_schema(), &logical_indices)
+            else {
+                return Ok(None);
+            };
+            if !scan_transform_dependencies_fit(&transform, scan.physical_schema()) {
+                return Ok(None);
+            }
+            // Validate implicit StructPatch dependencies as well as explicit Column refs.
+            // Unsupported transforms keep the original plan rather than inventing values.
+            let evaluator = ARROW_HANDLER
+                .new_expression_evaluator(
+                    Arc::clone(scan.physical_schema()),
+                    Arc::clone(&transform),
+                    kernel_type.clone(),
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if evaluator
+                .evaluate_arrow(RecordBatch::new_empty(Arc::clone(&parquet_read_schema)))
+                .is_err()
+            {
+                return Ok(None);
+            }
+            transforms.insert(file.clone(), transform);
+        }
+        let mut contract = old.contract.clone();
+        contract.scan_schema = Arc::new(old.contract.scan_schema.project(&logical_indices)?);
+        let result_indices = names
+            .iter()
+            .map(|name| old.contract.result_schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        contract.result_schema = Arc::new(old.contract.result_schema.project(&result_indices)?);
+        contract.result_projection = None;
+        contract.kernel_projection = Some(
+            logical_indices
+                .iter()
+                .map(|&i| old.contract.kernel_projection.as_ref().map_or(i, |p| p[i]))
+                .collect(),
+        );
+        contract.retain_file_id &= requested.contains(&self.input_file_id_column);
+        contract.retain_row_index &= contract
+            .row_index_field
+            .as_ref()
+            .is_some_and(|field| requested.contains(field.name()));
+        let mut fields = contract.result_schema.fields().to_vec();
+        if contract.retain_file_id {
+            fields.push(Arc::clone(&contract.file_id_field));
+        }
+        if let Some(field) = contract.retained_row_index_field() {
+            fields.push(field);
+        }
+        contract.output_schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema().metadata().clone(),
+        ));
+        let input_exprs = parquet_read_schema
+            .fields()
+            .iter()
+            .chain(std::iter::once(&old.contract.file_id_field))
+            .map(|field| {
+                Ok(ProjectionExpr {
+                    expr: Arc::new(Column::new(
+                        field.name(),
+                        self.input.schema().index_of(field.name())?,
+                    )),
+                    alias: field.name().clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input = Arc::new(ProjectionExec::try_new(
+            input_exprs,
+            Arc::clone(&self.input),
+        )?) as Arc<dyn ExecutionPlan>;
+        // Embed the column projection in the existing readers before checking positional
+        // masks. Unsupported child shapes retain the original scan and its strict validator.
+        let input = ProjectionPushdown::new().optimize(input, &ConfigOptions::default())?;
+        if self.has_deletion_vectors() && self.validate_dv_child_topology(&input).is_err() {
+            return Ok(None);
+        }
+        let plan = Self::new(
+            Arc::new(KernelScanPlan {
+                scan,
+                contract,
+                parquet_read_schema,
+                ..old.as_ref().clone()
+            }),
+            input,
+            Arc::new(transforms),
+            self.dv_state.clone(),
+            Arc::clone(&self.public_file_ids),
+            self.partition_stats.clone(),
+            self.metrics.clone(),
+        );
+        let output_mapping = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                Ok(ProjectionExpr {
+                    expr: Arc::new(Column::new(
+                        field.name(),
+                        self.schema().index_of(field.name())?,
+                    )),
+                    alias: field.name().clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Rebind the original expressions above the scan. Casts and computed values
+        // retain their original evaluation position, aliases, and output types.
+        let exprs = projection
+            .expr()
+            .iter()
+            .map(|expr| {
+                Ok(
+                    update_expr(&expr.expr, &output_mapping, false)?.map(|value| ProjectionExpr {
+                        expr: value,
+                        alias: expr.alias.clone(),
+                    }),
+                )
+            })
+            .collect::<Result<Option<Vec<_>>>>()?;
+        let Some(exprs) = exprs else { return Ok(None) };
+        Ok(Some(Arc::new(
+            ProjectionExec::try_new_with_schema_metadata(
+                exprs,
+                Arc::new(plan),
+                projection.schema().as_ref(),
+            )?,
+        )))
     }
 
     fn repartitioned(
@@ -1105,6 +1401,167 @@ mod tests {
         },
         test_utils::{TestResult, TestTables, open_fs_path},
     };
+
+    #[tokio::test]
+    async fn physical_projection_prunes_reads_without_losing_partitions_or_dv_masks() -> TestResult
+    {
+        use datafusion::physical_optimizer::{
+            PhysicalOptimizerRule, projection_pushdown::ProjectionPushdown,
+        };
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        for (fixture, computed) in itertools::iproduct!(
+            [
+                "multi_partitioned",
+                "column_mapping",
+                "with_schema_change",
+                "deletion_vectors"
+            ],
+            [false, true]
+        ) {
+            let table = open_fs_path(&format!(
+                "../../dat/v0.0.3/reader_tests/generated/{fixture}/delta"
+            ));
+            let provider = table
+                .table_provider()
+                .with_file_column("file_id")
+                .with_row_index_column("row_index")
+                .await?;
+            let session = create_session().into_inner();
+            let value_name = if fixture == "with_schema_change" {
+                "num2"
+            } else {
+                "letter"
+            };
+            for names in [
+                vec![value_name],
+                vec!["file_id", value_name],
+                vec!["row_index", "file_id", value_name],
+                vec!["file_id"],
+                vec!["row_index"],
+            ] {
+                let indices = names
+                    .iter()
+                    .map(|name| provider.schema().index_of(name))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let full = provider.scan(&session.state(), None, &[], None).await?;
+                let original_width = full
+                    .downcast_ref::<DeltaScanExec>()
+                    .unwrap()
+                    .input
+                    .schema()
+                    .fields()
+                    .len();
+                let projection = |input: Arc<dyn ExecutionPlan>| {
+                    let exprs = names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let column = Arc::new(Column::new(name, input.schema().index_of(name)?))
+                                as Arc<dyn PhysicalExpr>;
+                            let expression = if computed && *name == value_name {
+                                Arc::new(datafusion::physical_expr::expressions::CastExpr::new(
+                                    column,
+                                    DataType::Utf8View,
+                                    None,
+                                )) as Arc<dyn PhysicalExpr>
+                            } else {
+                                column
+                            };
+                            Ok((expression, format!("value_{i}")))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok::<_, DataFusionError>(
+                        Arc::new(ProjectionExec::try_new(exprs, input)?) as Arc<dyn ExecutionPlan>
+                    )
+                };
+                let plan = projection(full)?;
+                let optimized = ProjectionPushdown::new()
+                    .optimize(Arc::clone(&plan), session.state().config().options())?;
+                assert_eq!(
+                    optimized.schema(),
+                    plan.schema(),
+                    "output aliases and types must survive"
+                );
+                let mut node = Arc::clone(&optimized);
+                while node.downcast_ref::<DeltaScanExec>().is_none() {
+                    node = Arc::clone(node.children()[0]);
+                }
+                if names.contains(&value_name) {
+                    assert!(
+                        node.downcast_ref::<DeltaScanExec>()
+                            .unwrap()
+                            .input
+                            .schema()
+                            .fields()
+                            .len()
+                            < original_width,
+                        "unused physical columns must not be read"
+                    );
+                }
+                let reference = if names.contains(&value_name) {
+                    projection(
+                        provider
+                            .scan(&session.state(), Some(&indices), &[], None)
+                            .await?,
+                    )?
+                } else {
+                    // The existing logical metadata-only path also hits the kernel's
+                    // empty-struct limitation. The unchanged wide scan supplies the oracle.
+                    Arc::clone(&plan)
+                };
+                let expected = collect(reference, session.task_ctx()).await?;
+                assert!(
+                    expected.iter().any(|batch| batch.num_rows() > 0),
+                    "fixture must contain visible rows"
+                );
+                if names.contains(&value_name) || names.contains(&"row_index") {
+                    assert_eq!(
+                        node.downcast_ref::<DeltaScanExec>()
+                            .unwrap()
+                            .consumes_row_positions(),
+                        fixture == "deletion_vectors" || names.contains(&"row_index")
+                    );
+                }
+                let rows = |batches: &[RecordBatch]| {
+                    let mut rows = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            (0..batch.num_rows()).map(move |row| {
+                                batch
+                                    .columns()
+                                    .iter()
+                                    .map(|column| {
+                                        (
+                                            column.is_null(row),
+                                            arrow::util::display::array_value_to_string(
+                                                column.as_ref(),
+                                                row,
+                                            )
+                                            .unwrap(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    rows
+                };
+                for _ in 0..2 {
+                    let execution = datafusion::physical_plan::execution_plan::reset_plan_states(
+                        Arc::clone(&optimized),
+                    )?;
+                    assert_eq!(
+                        rows(&collect(execution, session.task_ctx()).await?),
+                        rows(&expected),
+                        "{fixture}: preserve partitions, file ids, and visible rows on every execution"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_scan_nested() -> TestResult {
